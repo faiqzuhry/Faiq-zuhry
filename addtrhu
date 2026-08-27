@@ -1,0 +1,176 @@
+#!/bin/bash
+
+# Check if the script is run as root
+if [ "$(id -u)" != "0" ]; then
+    echo "Error: Skrip ini harus dijalankan sebagai root."
+    exit 1
+fi
+clear
+# Mengambil nilai domain, port dan token dari file
+domain=$(cat /etc/data/domain)
+token=$(cat /etc/data/token.json | jq -r .access_token)
+port=$(netstat -tunlp | grep 'python' | awk '{split($4, a, ":"); print a[2]}')
+
+# Meminta input pengguna
+while true; do
+    read -rp "Username: " -e user
+
+    # Validasi panjang karakter
+    if [[ ${#user} -lt 4 || ${#user} -gt 32 ]]; then
+        echo "Username harus memiliki panjang minimal 4 karakter dan maksimal 32 karakter."
+        continue
+    fi
+
+    # Validasi karakter tanpa spesial karakter
+    if [[ ! "$user" =~ ^[a-zA-Z0-9_]+$ ]]; then
+        echo "Username hanya dapat mengandung huruf, angka, dan underscore (_) tanpa karakter spesial."
+        continue
+    fi
+
+    TOTAL_USERS=$(curl -s -X 'GET' \
+        "https://${domain}:${port}/api/users?username=${user}" \
+        -H 'accept: application/json' \
+        -H "Authorization: Bearer ${token}" \
+        | jq -r '.total')
+
+    if [[ ${TOTAL_USERS} == '1' ]]; then
+        echo ""
+        echo "Klien dengan username ${user} sudah terdaftar pada database, mohon gunakan username lain."
+        exit 1
+    fi
+
+    # Jika semua validasi terpenuhi, keluar dari loop
+    break
+done
+
+read -rp "Catatan user: " -e catatan
+echo "Masa aktif"
+echo "[biarkan kosong atau tekan saja enter jika tidak butuh masa aktif / AlwaysON]"
+read -p "Expired (Hari): " masaaktif
+echo "[biarkan kosong atau tekan saja enter jika ingin sett Unlimited Quota]"
+read -rp "Quota (GB): " -e gb
+
+if [ -n "$gb" ]; then
+    limitq=$((gb * 1024**3))
+    quota_text="${gb} GB"
+
+# Menampilkan opsi reset data
+echo "Pilih jenis siklus reset data:"
+echo "1. Tanpa ada reset"
+echo "2. Harian"
+echo "3. Mingguan"
+echo "4. Bulanan"
+echo "5. Tahunan"
+
+# Menerima input pilihan pengguna
+read -p "Masukkan nomor pilihan Anda: " choice
+
+# Memilih strategi reset berdasarkan pilihan pengguna
+case $choice in
+    1)
+        reset_strategy="no_reset"
+        ;;
+    2)
+        reset_strategy="day"
+        ;;
+    3)
+        reset_strategy="week"
+        ;;
+    4)
+        reset_strategy="month"
+        ;;
+    5)
+        reset_strategy="year"
+        ;;
+    *)
+        echo "Pilihan tidak valid."
+        exit 1
+        ;;
+esac
+    
+else
+    limitq=0
+    quota_text="Unlimited"
+    reset_strategy="no_reset"
+fi
+
+# Menggunakan variable pass untuk generate password
+pass=$(</dev/urandom tr -dc 'a-zA-Z0-9' | head -c 15; echo)
+
+if [ -n "$masaaktif" ]; then
+    exp="$(date -d "${masaaktif} days" +"%s")"
+    exp2=$(date -d "${masaaktif} days" +"%Y-%m-%d")
+else
+    exp=0
+    exp2=AlwaysON
+fi
+
+# Mengirimkan permintaan ke API
+curl -X 'POST' \
+  "https://${domain}:${port}/api/user" \
+  -H 'accept: application/json' \
+  -H "Authorization: Bearer ${token}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "username": "'"${user}"'",
+  "proxies": {
+    "trojan": {
+      "password": "'"${pass}"'"
+    }
+  },
+  "inbounds": {
+    "trojan": [
+      "TROJAN_HU"
+    ]
+  },
+  "expire": '"${exp}"',
+  "data_limit": '"${limitq}"',
+  "data_limit_reset_strategy": "'"${reset_strategy}"'",
+  "status": "active",
+  "note": "'"${catatan}"'"
+}' > /tmp/${user}_trojan.json
+
+subs=$(cat /tmp/${user}_trojan.json | jq -r .subscription_url)
+
+# Link Trojan
+trojanlink5="trojan://${pass}@${domain}:443?security=tls&type=httpupgrade&host=${domain}&headerType=&path=%2Ftrojanupgrade&sni=${domain}&fp=&alpn=http%2F1.1#%28${user}%29%20%5BTrojan%20-%20HTTPUpgrade%5D%20TLS"
+trojanlink6="trojan://${pass}@${domain}:80?security=none&type=httpupgrade&host=${domain}&headerType=&path=%2Ftrojanupgrade#%28${user}%29%20%5BTrojan%20-%20HTTPUpgrade%5D%20nonTLS"
+clear
+echo -e "=======-XRAY/TROJAN-HU======="
+echo -e ""
+echo -e "Remarks: ${user}"
+echo -e "Domain: ${domain}"
+echo -e "Quota: ${quota_text}"
+# Replace values and specific reset strategies
+  case "${reset_strategy}" in
+    "no_reset") reset_strategy="Loss_doll";;
+    "day") reset_strategy="Harian";;
+    "week") reset_strategy="Mingguan";;
+    "month") reset_strategy="Bulanan";;
+    "year") reset_strategy="Tahunan";;
+esac
+echo -e "Reset Quota Strategy: ${reset_strategy}"
+echo -e "================================="
+echo -e "🔑 Port TLS: 443, 8443, 8880"
+echo -e "🔑 Port nonTLS: 80, 2082, 2083, 3128, 8080"
+echo -e "================================="
+echo -e "password: ${pass}"
+echo -e "================================="
+echo -e "network: httpupgrade"
+echo -e "================================="
+echo -e "path: "
+echo -e "a.) HTTP Upgrade: /trojaupgrade"
+echo -e "================================="
+echo -e "alpn: http/1.1"
+echo -e "================================="
+echo -e "tls: true / false"
+echo -e "allowInsecure: true"
+echo -e "================================="
+echo -e "Trojan-HTTPUpgrade TLS: ${trojanlink5}"
+echo -e "================================="
+echo -e "Trojan-HTTPUpgrade nTLS: ${trojanlink6}"
+echo -e "================================="
+echo -e "Link Subscription : https://${domain}:${port}${subs}"
+echo -e "================================="
+echo -e "Masa Aktif: ${exp2}"
+rm -r /tmp/${user}_trojan.json

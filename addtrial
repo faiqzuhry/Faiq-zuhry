@@ -1,0 +1,321 @@
+#!/bin/bash
+
+# Check if the script is run as root
+if [ "$(id -u)" != "0" ]; then
+    echo "Error: Skrip ini harus dijalankan sebagai root."
+    exit 1
+fi
+clear
+# Function to create VPN user based on protocol
+create_vpn_user() {
+  protocol=$1
+  case $protocol in
+    "trojan")
+      username="${protocol}trial-${kataacak}"
+      pass=$(</dev/urandom tr -dc 'a-zA-Z0-9' | head -c 15; echo)
+      curl -X 'POST' \
+        "https://${domain}:${port}/api/user" \
+        -H 'accept: application/json' \
+        -H "Authorization: Bearer ${token}" \
+        -H 'Content-Type: application/json' \
+        -d '{
+          "username": "'"${username}"'",
+          "proxies": {
+            "trojan": {
+              "password": "'"${pass}"'"
+            }
+          },
+          "expire": '"${exp}"',
+          "data_limit": '"${limitq}"',
+          "data_limit_reset_strategy": "'"${reset_strategy}"'",
+          "status": "active",
+          "note": "'"${username}"'"
+        }' > "/tmp/${username}_${protocol}.json"
+      ;;
+    "vmess")
+      username="${protocol}trial-${kataacak}"
+      uuid=$(cat /proc/sys/kernel/random/uuid)
+      curl -X 'POST' \
+        "https://${domain}:${port}/api/user" \
+        -H 'accept: application/json' \
+        -H "Authorization: Bearer ${token}" \
+        -H 'Content-Type: application/json' \
+        -d '{
+          "username": "'"${username}"'",
+          "proxies": {
+            "vmess": {
+              "id": "'"${uuid}"'"
+            }
+          },
+          "expire": '"${exp}"',
+          "data_limit": '"${limitq}"',
+          "data_limit_reset_strategy": "'"${reset_strategy}"'",
+          "status": "active",
+          "note": "'"${username}"'"
+        }' > "/tmp/${username}_${protocol}.json"
+      ;;
+    "vless")
+      username="${protocol}trial-${kataacak}"
+      uuid=$(cat /proc/sys/kernel/random/uuid)
+      curl -X 'POST' \
+        "https://${domain}:${port}/api/user" \
+        -H 'accept: application/json' \
+        -H "Authorization: Bearer ${token}" \
+        -H 'Content-Type: application/json' \
+        -d '{
+          "username": "'"${username}"'",
+          "proxies": {
+            "vless": {
+              "id": "'"${uuid}"'",
+              "flow": "none"
+            }
+          },
+          "expire": '"${exp}"',
+          "data_limit": '"${limitq}"',
+          "data_limit_reset_strategy": "'"${reset_strategy}"'",
+          "status": "active",
+          "note": "'"${username}"'"
+        }' > "/tmp/${username}_${protocol}.json"
+      ;;
+    "ss")
+      username="${protocol}trial-${kataacak}"
+      pass=$(</dev/urandom tr -dc 'a-zA-Z0-9' | head -c 15; echo)
+      curl -X 'POST' \
+        "https://${domain}:${port}/api/user" \
+        -H 'accept: application/json' \
+        -H "Authorization: Bearer ${token}" \
+        -H 'Content-Type: application/json' \
+        -d '{
+          "username": "'"${username}"'",
+          "proxies": {
+            "shadowsocks": {
+               "password": "'"${pass}"'",
+	           "method": "aes-128-gcm"
+            }
+        },
+          "expire": '"${exp}"',
+          "data_limit": '"${limitq}"',
+          "data_limit_reset_strategy": "'"${reset_strategy}"'",
+          "status": "active",
+          "note": "'"${username}"'"
+        }' > "/tmp/${username}_${protocol}.json"
+        ;;
+    *)
+      echo "Unknown protocol"
+      exit 1
+      ;;
+  esac
+}
+
+# Function to display VPN user details based on protocol
+display_user_details() {
+  protocol=$1
+  username="${protocol}trial-${kataacak}"
+  case $protocol in
+    "trojan")
+clear
+echo -e "=======-XRAY/TROJAN======="
+echo -e ""
+echo -e "Remarks: ${username}"
+echo -e "Domain: ${domain}"
+echo -e "Quota: Unlimited"
+# Replace values and specific reset strategies
+  case "${reset_strategy}" in
+    "no_reset") reset_strategy="Loss_doll";;
+esac
+echo -e "Reset Quota Strategy: ${reset_strategy}"
+echo -e "================================="
+echo -e "🔑 Port TLS: 443, 8443, 8880"
+echo -e "🔑 Port nonTLS: 80, 2082, 2083, 3128, 8080"
+echo -e "================================="
+echo -e "Password: ${pass}"
+echo -e "================================="
+echo -e "network: ws/httpupgrade/grpc"
+echo -e "================================="
+echo -e "path & serviceName: "
+echo -e "a.) WS: /trojan atau /enter-your-custom-path/trojan"
+echo -e "b.) GRPC: trojan-service"
+echo -e "c.) HTTP Upgrade: /trojan-http"
+echo -e "================================="
+echo -e "alpn: "
+echo -e "a.) WS/HU: http/1.1"
+echo -e "b.) GRPC: h2"
+echo -e "================================="
+echo -e "tls:"
+echo -e "a.) WS/HU: true (tls), false (nontls)"
+echo -e "b.) GRPC: true"
+echo -e "allowInsecure: true"
+echo -e "================================="
+echo -e "Link Subscription : https://${domain}:${port}${subs}"
+echo -e "================================="
+echo -e "Masa Aktif: ${human_readable_exp} [${expiry_minutes} Menit]" 
+      ;;
+    "vmess")
+clear
+echo -e "=======-XRAY/VMESS======="
+echo -e ""
+echo -e "Remarks: ${username}"
+echo -e "Domain: ${domain}"
+echo -e "Quota: Unlimited"
+# Replace values and specific reset strategies
+  case "${reset_strategy}" in
+    "no_reset") reset_strategy="Loss_doll";;
+esac
+echo -e "Reset Quota Strategy: ${reset_strategy}"
+echo -e "================================="
+echo -e "🔑 Port TLS: 443, 8443, 8880"
+echo -e "🔑 Port nonTLS: 80, 2082, 2083, 3128, 8080"
+echo -e "================================="
+echo -e "id: ${uuid}"
+echo -e "alterID: 0"
+echo -e "security: auto"
+echo -e "================================="
+echo -e "network: ws/httpupgrade/grpc"
+echo -e "================================="
+echo -e "path & serviceName: "
+echo -e "a.) WS TLS & NonTLS: /vmess atau /enter-your-custom-path/vmess"
+echo -e "b.) GRPC TLS: vmess-service"
+echo -e "c.) HTTP Upgrade: /vmess-http"
+echo -e "================================="
+echo -e "alpn: "
+echo -e "a.) WS/HU: http/1.1"
+echo -e "b.) GRPC: h2"
+echo -e "================================="
+echo -e "tls:"
+echo -e "a.) WS/HU: true (tls), false (nontls)"
+echo -e "b.) GRPC: true"
+echo -e "allowInsecure: true"
+echo -e "================================="
+echo -e "Link Subscription : https://${domain}:${port}${subs}"
+echo -e "================================="
+echo -e "Masa Aktif: ${human_readable_exp} [${expiry_minutes} Menit]" 
+      ;;
+    "vless")
+clear
+echo -e "=======-XRAY/VLESS======="
+echo -e ""
+echo -e "Remarks: ${username}"
+echo -e "Domain: ${domain}"
+echo -e "Quota: Unlimited"
+# Replace values and specific reset strategies
+  case "${reset_strategy}" in
+    "no_reset") reset_strategy="Loss_doll";;
+esac
+echo -e "Reset Quota Strategy: ${reset_strategy}"
+echo -e "================================="
+echo -e "🔑 Port TLS: 443, 8443, 8880"
+echo -e "🔑 Port nonTLS: 80, 2082, 2083, 3128, 8080"
+echo -e "================================="
+echo -e "id: ${uuid}"
+echo -e "decryption: none"
+echo -e "================================="
+echo -e "network: ws/httpupgrade/grpc"
+echo -e "================================="
+echo -e "path: "
+echo -e "a.) WS: /vless atau /enter-your-custom-path/vless"
+echo -e "b.) GRPC: vless-service"
+echo -e "c.) HTTP Upgrade: /vless-http"
+echo -e "================================="
+echo -e "alpn: "
+echo -e "a.) WS/HU: http/1.1"
+echo -e "b.) GRPC: h2"
+echo -e "================================="
+echo -e "tls:"
+echo -e "a.) WS/HU: true (tls), false (nontls)"
+echo -e "b.) GRPC: true"
+echo -e "================================="
+echo -e "allowInsecure: true"
+echo -e "================================="
+echo -e "Link Subscription : https://${domain}:${port}${subs}"
+echo -e "================================="
+echo -e "Masa Aktif: ${human_readable_exp} [${expiry_minutes} Menit]" 
+      ;;
+    "ss")
+clear
+echo -e "=======-XRAY/SHADOWSOCKS======="
+echo -e ""
+echo -e "Remarks: ${username}"
+echo -e "Domain: ${domain}"
+echo -e "Quota: Unlimited"
+# Replace values and specific reset strategies
+  case "${reset_strategy}" in
+    "no_reset") reset_strategy="Loss_doll";;
+esac
+echo -e "Reset Quota Strategy: ${reset_strategy}"
+echo -e "================================="
+echo -e "🔑 Port Outline: 1080"
+echo -e "🔑 Port TLS: 443, 8443, 8880"
+echo -e "🔑 Port nonTLS: 80, 2082, 2083, 3128, 8080"
+echo -e "================================="
+echo -e "password: ${pass}"
+echo -e "================================="
+echo -e "network: none/ws/grpc"
+echo -e "================================="
+echo -e "path: "
+echo -e "a.) WS: /shadowsocks atau /enter-your-custom-path/shadowsocks"
+echo -e "b.) GRPC: shadowsocks-service"
+echo -e "================================="
+echo -e "alpn: "
+echo -e "a.) WS: http/1.1"
+echo -e "b.) GRPC: h2"
+echo -e "================================="
+echo -e "tls:"
+echo -e "a.) WS: true (tls), false (nontls)"
+echo -e "b.) GRPC: true"
+echo -e "allowInsecure: true"
+echo -e "================================="
+echo -e "Link Subscription : https://${domain}:${port}${subs}"
+echo -e "================================="
+echo -e "Masa Aktif: ${human_readable_exp} [${expiry_minutes} Menit]" 
+      ;;
+    *)
+      echo "Unknown protocol"
+      ;;
+  esac
+}
+
+# Main script
+
+# Check if the correct number of arguments is provided
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 <protocol> <expiry_minutes>"
+  echo "<protocol> yang dapat dipilih adalah <trojan> <vmess> <vless> <ss> (masukkan salah satu pilihan tanpa tanda <>)"
+  exit 1
+fi
+
+# Input variables (replace with actual values)
+port=$(netstat -tunlp | grep 'python' | awk '{split($4, a, ":"); print a[2]}')
+domain=$(cat /etc/data/domain)
+token=$(cat /etc/data/token.json | jq -r .access_token)
+kataacak=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c12)
+exp="$(date -d "+$2 minutes" +"%s")"
+limitq="0"
+reset_strategy="no_reset"
+
+protocol=$1
+expiry_minutes=$2
+
+# Create VPN user
+create_vpn_user $protocol
+subs=$(cat "/tmp/${username}_${protocol}.json" | jq -r .subscription_url)
+
+# Buat skrip hapus_trial
+echo "#!/bin/bash
+hapus ${username}
+(crontab -l | grep -v "/usr/bin/hapus_trial${username}") | crontab -
+rm -r /usr/bin/hapus_trial${username}" > /usr/bin/hapus_trial${username}
+
+# Berikan izin eksekusi untuk skrip hapus_trial
+chmod +x "/usr/bin/hapus_trial${username}"
+
+# Tambahkan entri crontab untuk menjalankan hapus_trial
+(crontab -l 2>/dev/null; echo "*/${expiry_minutes} * * * * /usr/bin/hapus_trial${username}") | crontab -
+
+# Convert expiration time to human-readable format
+human_readable_exp=$(date -d "@$exp" +"%Y-%m-%d %H:%M:%S")
+
+# Display user details
+display_user_details $protocol
+
+# Clean up
+rm -r "/tmp/${username}_${protocol}.json"

@@ -1,0 +1,45 @@
+#!/bin/bash
+
+# Check if the script is run as root
+if [ "$(id -u)" != "0" ]; then
+    echo "Error: Skrip ini harus dijalankan sebagai root."
+    exit 1
+fi
+
+# Mengambil nilai domain dan token dari file
+domain=$(cat /etc/data/domain)
+token=$(cat /etc/data/token.json | jq -r .access_token)
+port=$(netstat -tunlp | grep 'python' | awk '{split($4, a, ":"); print a[2]}')
+tanggal=$(date +"%m-%d-%Y")
+waktu=$(date +"%T")
+
+# Fungsi untuk mengecek dan menghapus akun yang telah kedaluwarsa
+check_expired() {
+  local api_url="https://${domain}:${port}/api/users?status=expired"
+
+  # Ambil data pengguna yang sudah kadaluwarsa
+  expired_users=$(curl -s -X 'GET' \
+    "${api_url}" \
+    -H 'accept: application/json' \
+    -H "Authorization: Bearer ${token}")
+
+  # Iterasi melalui setiap pengguna yang sudah kadaluwarsa
+  echo "${expired_users}" | jq -c '.users[] | select(.status == "expired")' | while read -r user_info; do
+    # Ambil informasi protokol dari setiap pengguna
+    protocol=$(echo "${user_info}" | jq -r '.proxies | keys_unsorted[0]' | tr -d '\n' | tr -d ' ')
+
+    # Ambil username dari setiap pengguna
+    username=$(echo "${user_info}" | jq -r '.username' | tr -d '\n' | tr -d ' ')
+
+    # Hapus akun dari server
+    curl -X 'DELETE' \
+      "https://${domain}/api/user/${username}" \
+      -H 'accept: application/json' \
+      -H "Authorization: Bearer ${token}" &> /dev/null
+
+    echo "Pada tanggal ${tanggal} pukul ${waktu}, Untuk user ${username} dengan protokol ${protocol} telah mencapai Expired" >> "/etc/data/log-exp-${protocol}.txt"
+  done
+}
+
+# Jalankan fungsi
+check_expired
