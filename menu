@@ -228,7 +228,7 @@ user_menu() {
             "VLess" "VLess WS" "VLess gRPC" "VLess HTTP Upgrade" \
             "Trojan" "Trojan WS" "Trojan gRPC" "Trojan HTTP Upgrade" \
             "Shadowsocks" "Shadowsocks WS" "Shadowsocks gRPC" "Shadowsocks Upgrade" \
-            "Shadowsocks Outline" "Trial User" "‹ Kembali"
+            "Shadowsocks Outline" "Trial User"
 
         case "$MENU_CHOICE" in
             1) run_cmd "addvmess" ;;
@@ -262,7 +262,7 @@ config_menu() {
             "Renew User" "Reset Usage" "Cek Status User" "Cek Login Xray" \
             "Buat Token API" "Cek Log Xray" "Cek Error Xray" "Cek Log Nginx" \
             "Cek RAM" "Set Limit Xray" "Benchmark VPS" "Ganti Xray Core" \
-            "WARP" "Routing" "Lihat Routing" "‹ Kembali"
+            "WARP" "Routing" "Lihat Routing" "Ganti Domain"
 
         case "$MENU_CHOICE" in
             1) run_cmd "menu-backup" ;;
@@ -301,6 +301,25 @@ config_menu() {
             17) run_cmd "warp" ;;
             18) run_cmd "routing" ;;
             19) run_cmd "seeroute" ;;
+
+            20)
+                cleanup
+                clear
+                if command -v ganti_domain >/dev/null 2>&1; then
+                    ganti_domain
+                elif [ -x /root/ganti_domain ]; then
+                    /root/ganti_domain
+                else
+                    echo
+                    echo "Error: ganti_domain tidak ditemukan."
+                    echo
+                    echo "Pastikan file tersedia di:"
+                    echo "  /root/ganti_domain"
+                    echo
+                fi
+                read -rp "Tekan ENTER untuk kembali..."
+                ;;
+
             *) return ;;
         esac
     done
@@ -312,7 +331,7 @@ marzban_menu() {
         select_menu "MARZBAN CONTROL" \
             "Start Marzban" "Stop Marzban" "Restart Marzban" \
             "Status Marzban" "Logs Marzban" "Update Marzban" \
-            "Buat Admin Sudo" "List Admin" "List User" "‹ Kembali"
+            "Buat Admin Sudo" "List Admin" "List User"
 
         case "$MENU_CHOICE" in
             1) run_cmd "marzban up" ;;
@@ -364,3 +383,4 @@ while :; do
         5|0) cleanup; clear; exit 0 ;;
     esac
 done
+

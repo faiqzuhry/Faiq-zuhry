@@ -120,6 +120,83 @@ safe_sysctl_apply(){
     return 0
 }
 
+# ===== AUTO SWAP 2GB =====
+# Membuat dan mengaktifkan Swap 2GB pada VPS baru.
+# Aman untuk --resume dan tidak membuat swap kedua jika sudah ada >= 2GB.
+
+setup_swap_2gb(){
+    local SWAPFILE="/swapfile"
+    local SWAP_MB=2048
+    local CURRENT_SWAP_MB=0
+
+    CURRENT_SWAP_MB="$(free -m 2>/dev/null | awk '/^Swap:/ {print $2+0}')"
+
+    # Jika sudah ada Swap >= 2GB, pertahankan konfigurasi yang ada.
+    if [ "${CURRENT_SWAP_MB:-0}" -ge "$SWAP_MB" ]; then
+        colorized_echo green "[✓] Swap >= 2GB sudah tersedia."
+        return 0
+    fi
+
+    # Jika /swapfile ada tetapi tidak aktif/ukurannya salah, buat ulang.
+    if [ -f "$SWAPFILE" ]; then
+        if swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$SWAPFILE"; then
+            colorized_echo green "[✓] /swapfile sudah aktif."
+            return 0
+        fi
+        rm -f "$SWAPFILE"
+    fi
+
+    colorized_echo cyan "[*] Membuat Swap 2GB..."
+
+    if command -v fallocate >/dev/null 2>&1; then
+        fallocate -l 2G "$SWAPFILE" 2>/dev/null || true
+    fi
+
+    # Fallback jika fallocate gagal/tidak tersedia.
+    if [ ! -f "$SWAPFILE" ] || \
+       [ "$(stat -c '%s' "$SWAPFILE" 2>/dev/null || echo 0)" -lt 2147483648 ]; then
+        rm -f "$SWAPFILE"
+        dd if=/dev/zero of="$SWAPFILE" bs=1M count=2048 status=none
+    fi
+
+    chmod 600 "$SWAPFILE"
+
+    if ! mkswap "$SWAPFILE" >/dev/null 2>&1; then
+        colorized_echo yellow "[!] Gagal membuat Swap 2GB."
+        rm -f "$SWAPFILE"
+        return 0
+    fi
+
+    if ! swapon "$SWAPFILE" >/dev/null 2>&1; then
+        colorized_echo yellow "[!] Gagal mengaktifkan Swap 2GB."
+        return 0
+    fi
+
+    # Permanen setelah reboot.
+    if ! grep -qE '^[[:space:]]*/swapfile[[:space:]]+none[[:space:]]+swap([[:space:]]|$)' /etc/fstab 2>/dev/null; then
+        echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    fi
+
+    # Swap hanya dipakai ketika memang diperlukan.
+    if [ -f /etc/sysctl.conf ]; then
+        if grep -qE '^[[:space:]]*vm\.swappiness=' /etc/sysctl.conf; then
+            sed -i 's/^[[:space:]]*vm\.swappiness=.*/vm.swappiness=10/' /etc/sysctl.conf
+        else
+            echo "vm.swappiness=10" >> /etc/sysctl.conf
+        fi
+    else
+        echo "vm.swappiness=10" > /etc/sysctl.conf
+    fi
+
+    sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+
+    colorized_echo green "[✓] Swap 2GB berhasil dibuat dan diaktifkan."
+}
+
+setup_swap_2gb
+
+# ===== END AUTO SWAP 2GB =====
+
 stage01(){
     local supported_os=false
     if [ -f /etc/os-release ]; then
@@ -443,7 +520,476 @@ wget -O addssgrpc "$sfile/command/addssgrpc" && chmod +x addssgrpc
 #Additional
 wget -O status "$sfile/command/status" && chmod +x status
 wget -O addtrial "$sfile/command/addtrial" && chmod +x addtrial
-wget -O menu "$sfile/command/menu" && chmod +x menu
+wget -O /usr/bin/menu "$sfile/command/menu" && chmod +x /usr/bin/menu
+cat > /usr/bin/ganti_domain <<'LINGVPN_GANTI_DOMAIN_EOF'
+#!/bin/bash
+
+MARZBAN_DIR="/opt/marzban"
+XRAY_CONF="/opt/marzban/xray.conf"
+CERT_DIR="/var/lib/marzban"
+CERT_FILE="/var/lib/marzban/xray.crt"
+KEY_FILE="/var/lib/marzban/xray.key"
+BACKUP_ROOT="/opt/marzban/domain-backups"
+
+info() {
+    echo -e "\033[1;36m[INFO]\033[0m $1"
+}
+
+ok() {
+    echo -e "\033[1;32m[ OK ]\033[0m $1"
+}
+
+warn() {
+    echo -e "\033[1;33m[WARN]\033[0m $1"
+}
+
+error() {
+    echo -e "\033[1;31m[ERR ]\033[0m $1"
+}
+
+die() {
+    error "$1"
+    exit 1
+}
+
+# ============================================================
+# CHECK
+# ============================================================
+
+if [ "$(id -u)" != "0" ]; then
+    die "Jalankan sebagai root."
+fi
+
+[ -d "$MARZBAN_DIR" ] || die "$MARZBAN_DIR tidak ditemukan."
+[ -f "$XRAY_CONF" ] || die "$XRAY_CONF tidak ditemukan."
+[ -f "$MARZBAN_DIR/docker-compose.yml" ] || die "docker-compose.yml tidak ditemukan."
+
+command -v docker >/dev/null 2>&1 || die "Docker tidak ditemukan."
+docker compose version >/dev/null 2>&1 || die "Docker Compose tidak tersedia."
+command -v curl >/dev/null 2>&1 || die "curl tidak ditemukan."
+command -v openssl >/dev/null 2>&1 || die "openssl tidak ditemukan."
+
+# ============================================================
+# HEADER
+# ============================================================
+
+clear 2>/dev/null
+
+echo
+echo "============================================================"
+echo "              MARZBAN DOMAIN CHANGER"
+echo "============================================================"
+echo
+echo "Direktori : /opt/marzban"
+echo
+echo "File yang dipertahankan:"
+echo "  .env"
+echo "  docker-compose.yml"
+echo "  default.conf"
+echo "  nginx.conf"
+echo "  konfigurasi Xray lainnya"
+echo "  WARP / WireProxy"
+echo
+echo "Yang diubah:"
+echo "  xray.conf server_name"
+echo "  xray.crt"
+echo "  xray.key"
+echo
+echo "============================================================"
+echo
+
+# ============================================================
+# CURRENT DOMAIN
+# ============================================================
+
+CURRENT_DOMAIN=$(grep -m1 '^[[:space:]]*server_name[[:space:]]' "$XRAY_CONF" | \
+    sed -E 's/^[[:space:]]*server_name[[:space:]]+([^;]+);.*/\1/')
+
+echo "Domain saat ini:"
+echo "  ${CURRENT_DOMAIN:-tidak ditemukan}"
+echo
+
+# ============================================================
+# INPUT
+# ============================================================
+
+read -r -p "Masukkan DOMAIN BARU: " NEW_DOMAIN
+
+NEW_DOMAIN=$(echo "$NEW_DOMAIN" | tr '[:upper:]' '[:lower:]')
+NEW_DOMAIN=${NEW_DOMAIN#http://}
+NEW_DOMAIN=${NEW_DOMAIN#https://}
+NEW_DOMAIN=${NEW_DOMAIN%%/*}
+NEW_DOMAIN=${NEW_DOMAIN%.}
+
+[ -n "$NEW_DOMAIN" ] || die "Domain kosong."
+
+case "$NEW_DOMAIN" in
+    *" "*|*"."*.*"")
+        ;;
+esac
+
+if ! echo "$NEW_DOMAIN" | grep -Eq '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'; then
+    die "Format domain tidak valid: $NEW_DOMAIN"
+fi
+
+# ============================================================
+# PUBLIC IP
+# ============================================================
+
+info "Mendeteksi IP publik VPS..."
+
+PUBLIC_IP=$(curl -4fsS --max-time 10 https://api.ipify.org 2>/dev/null)
+
+[ -n "$PUBLIC_IP" ] || die "Gagal mendeteksi IP publik VPS."
+
+echo "  IP VPS : $PUBLIC_IP"
+echo
+
+# ============================================================
+# DNS
+# ============================================================
+
+info "Mengecek DNS $NEW_DOMAIN ..."
+
+DNS_IP=""
+
+if command -v dig >/dev/null 2>&1; then
+    DNS_IP=$(dig +short A "$NEW_DOMAIN" 2>/dev/null | head -n1)
+elif command -v getent >/dev/null 2>&1; then
+    DNS_IP=$(getent ahostsv4 "$NEW_DOMAIN" 2>/dev/null | awk 'NR==1 {print $1}')
+else
+    DNS_IP=$(curl -4fsS --max-time 10 \
+        "https://dns.google/resolve?name=$NEW_DOMAIN&type=A" 2>/dev/null |
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' |
+        head -n1)
+fi
+
+if [ -z "$DNS_IP" ]; then
+    warn "DNS A record belum ditemukan."
+    echo
+    echo "Pastikan:"
+    echo "  $NEW_DOMAIN"
+    echo "mengarah ke:"
+    echo "  $PUBLIC_IP"
+    echo
+
+    read -r -p "Tetap lanjut? [y/N]: " ANSWER
+
+    [ "$ANSWER" = "y" ] || [ "$ANSWER" = "Y" ] || die "Dibatalkan."
+else
+    echo "  DNS : $DNS_IP"
+    echo
+
+    if [ "$DNS_IP" = "$PUBLIC_IP" ]; then
+        ok "DNS sudah mengarah ke VPS."
+    else
+        warn "DNS tidak sama dengan IP VPS."
+        echo "  VPS : $PUBLIC_IP"
+        echo "  DNS : $DNS_IP"
+        echo
+
+        read -r -p "Tetap lanjut? [y/N]: " ANSWER
+
+        [ "$ANSWER" = "y" ] || [ "$ANSWER" = "Y" ] || die "Dibatalkan."
+    fi
+fi
+
+# ============================================================
+# CONFIRM
+# ============================================================
+
+echo
+echo "============================================================"
+echo "Domain lama : ${CURRENT_DOMAIN:-unknown}"
+echo "Domain baru : $NEW_DOMAIN"
+echo "============================================================"
+echo
+
+read -r -p "Lanjut mengganti domain? [y/N]: " CONFIRM
+
+[ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ] || exit 0
+
+# ============================================================
+# BACKUP
+# ============================================================
+
+DATE_NOW=$(date +%Y%m%d-%H%M%S)
+BACKUP_DIR="$BACKUP_ROOT/$DATE_NOW"
+
+mkdir -p "$BACKUP_DIR"
+
+info "Membuat backup..."
+
+cp -a "$XRAY_CONF" "$BACKUP_DIR/xray.conf"
+cp -a "$MARZBAN_DIR/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
+cp -a "$MARZBAN_DIR/default.conf" "$BACKUP_DIR/default.conf"
+
+if [ -f "$MARZBAN_DIR/nginx.conf" ]; then
+    cp -a "$MARZBAN_DIR/nginx.conf" "$BACKUP_DIR/nginx.conf"
+fi
+
+if [ -f "$MARZBAN_DIR/.env" ]; then
+    cp -a "$MARZBAN_DIR/.env" "$BACKUP_DIR/.env"
+fi
+
+if [ -f "$CERT_FILE" ]; then
+    cp -a "$CERT_FILE" "$BACKUP_DIR/xray.crt"
+fi
+
+if [ -f "$KEY_FILE" ]; then
+    cp -a "$KEY_FILE" "$BACKUP_DIR/xray.key"
+fi
+
+ok "Backup dibuat:"
+echo "  $BACKUP_DIR"
+echo
+
+# ============================================================
+# CERTBOT
+# ============================================================
+
+if ! command -v certbot >/dev/null 2>&1; then
+
+    info "Certbot belum tersedia."
+
+    if command -v apt-get >/dev/null 2>&1; then
+        info "Menginstall certbot..."
+
+        export DEBIAN_FRONTEND=noninteractive
+
+        apt-get update -y
+        apt-get install -y certbot
+
+    else
+        die "Tidak dapat menginstall certbot."
+    fi
+fi
+
+# ============================================================
+# STOP NGINX
+# ============================================================
+
+info "Menghentikan Nginx sementara..."
+
+cd "$MARZBAN_DIR"
+
+docker compose stop nginx
+
+sleep 3
+
+# ============================================================
+# CHECK PORT 80
+# ============================================================
+
+if command -v ss >/dev/null 2>&1; then
+
+    PORT80=$(ss -ltn 2>/dev/null | grep -E '[:.]80[[:space:]]' || true)
+
+    if [ -n "$PORT80" ]; then
+        warn "Port 80 masih digunakan:"
+        echo "$PORT80"
+        die "Port 80 belum bebas."
+    fi
+
+fi
+
+# ============================================================
+# SSL
+# ============================================================
+
+info "Membuat SSL Let's Encrypt untuk:"
+echo "  $NEW_DOMAIN"
+echo
+
+certbot certonly \
+    --standalone \
+    --non-interactive \
+    --agree-tos \
+    --no-eff-email \
+    --preferred-challenges http \
+    --http-01-port 80 \
+    --cert-name "$NEW_DOMAIN" \
+    -d "$NEW_DOMAIN"
+
+LE_CERT="/etc/letsencrypt/live/$NEW_DOMAIN/fullchain.pem"
+LE_KEY="/etc/letsencrypt/live/$NEW_DOMAIN/privkey.pem"
+
+[ -f "$LE_CERT" ] || die "Certificate tidak ditemukan."
+[ -f "$LE_KEY" ] || die "Private key tidak ditemukan."
+
+ok "SSL berhasil dibuat."
+
+# ============================================================
+# COPY SSL
+# ============================================================
+
+info "Memasang SSL ke Marzban..."
+
+cp -L "$LE_CERT" "$CERT_FILE"
+cp -L "$LE_KEY" "$KEY_FILE"
+
+chmod 644 "$CERT_FILE"
+chmod 600 "$KEY_FILE"
+
+ok "SSL terpasang."
+
+# ============================================================
+# CHANGE SERVER_NAME
+# ============================================================
+
+info "Mengubah server_name..."
+
+sed -i -E \
+    "0,/^[[:space:]]*server_name[[:space:]]+[^;]+;/s//            server_name $NEW_DOMAIN;/" \
+    "$XRAY_CONF"
+
+# ============================================================
+# VERIFY SERVER_NAME
+# ============================================================
+
+FINAL_DOMAIN=$(grep -m1 '^[[:space:]]*server_name[[:space:]]' "$XRAY_CONF" | \
+    sed -E 's/^[[:space:]]*server_name[[:space:]]+([^;]+);.*/\1/')
+
+if [ "$FINAL_DOMAIN" != "$NEW_DOMAIN" ]; then
+    warn "server_name gagal diubah."
+
+    cp -a "$BACKUP_DIR/xray.conf" "$XRAY_CONF"
+
+    docker compose up -d nginx marzban
+
+    die "Perubahan dibatalkan."
+fi
+
+ok "server_name sekarang:"
+echo "  $FINAL_DOMAIN"
+echo
+
+# ============================================================
+# DOCKER COMPOSE CHECK
+# ============================================================
+
+info "Validasi Docker Compose..."
+
+docker compose config >/dev/null
+
+ok "Docker Compose valid."
+
+# ============================================================
+# START NGINX
+# ============================================================
+
+info "Menyalakan Nginx..."
+
+docker compose up -d nginx
+
+sleep 3
+
+# ============================================================
+# NGINX TEST
+# ============================================================
+
+info "Memeriksa konfigurasi Nginx..."
+
+if ! docker compose exec -T nginx nginx -t; then
+
+    warn "nginx -t gagal."
+
+    cp -a "$BACKUP_DIR/xray.conf" "$XRAY_CONF"
+    cp -a "$BACKUP_DIR/xray.crt" "$CERT_FILE" 2>/dev/null || true
+    cp -a "$BACKUP_DIR/xray.key" "$KEY_FILE" 2>/dev/null || true
+
+    docker compose restart nginx
+
+    die "Konfigurasi dikembalikan."
+fi
+
+ok "Nginx configuration OK."
+
+# ============================================================
+# START MARZBAN
+# ============================================================
+
+info "Memastikan Marzban aktif..."
+
+docker compose up -d marzban nginx
+
+sleep 5
+
+# ============================================================
+# STATUS
+# ============================================================
+
+echo
+echo "============================================================"
+echo "                 STATUS MARZBAN"
+echo "============================================================"
+
+docker compose ps
+
+echo
+
+# ============================================================
+# SSL INFO
+# ============================================================
+
+echo "============================================================"
+echo "                 INFORMASI SSL"
+echo "============================================================"
+
+openssl x509 \
+    -in "$CERT_FILE" \
+    -noout \
+    -subject \
+    -issuer \
+    -dates 2>/dev/null || true
+
+echo
+
+# ============================================================
+# LOCAL HTTPS TEST
+# ============================================================
+
+info "Mengecek HTTPS lokal..."
+
+HTTP_CODE=$(curl -k \
+    -sS \
+    -o /dev/null \
+    -w "%{http_code}" \
+    --resolve "$NEW_DOMAIN:443:127.0.0.1" \
+    --max-time 10 \
+    "https://$NEW_DOMAIN/" 2>/dev/null || true)
+
+if echo "$HTTP_CODE" | grep -Eq '^[0-9]{3}$'; then
+    ok "HTTPS merespons HTTP $HTTP_CODE"
+else
+    warn "HTTPS belum memberikan response."
+fi
+
+# ============================================================
+# FINISH
+# ============================================================
+
+echo
+echo "============================================================"
+echo "             GANTI DOMAIN SELESAI"
+echo "============================================================"
+echo
+echo "Domain baru : $NEW_DOMAIN"
+echo "SSL         : $CERT_FILE"
+echo "Backup      : $BACKUP_DIR"
+echo
+echo "Konfigurasi yang dipertahankan:"
+echo "  .env"
+echo "  docker-compose.yml"
+echo "  default.conf"
+echo "  nginx.conf"
+echo "  Xray proxy/location"
+echo "  WARP / WireProxy"
+echo
+echo "============================================================"
+
+LINGVPN_GANTI_DOMAIN_EOF
+chmod +x /usr/bin/ganti_domain
 wget -O ceklogin "$sfile/command/ceklogin" && chmod +x ceklogin
 wget -O hapus "$sfile/command/hapus" && chmod +x hapus
 wget -O renew "$sfile/command/renew" && chmod +x renew
@@ -714,6 +1260,521 @@ systemctl restart cron;
 }
 
 
+
+
+# =========================================================
+# BOT USAGE - FINAL
+# Menggunakan BOT_TOKEN + CHAT_ID yang SAMA dengan BWBOT/menu-backup.
+# Tidak memakai python-telegram-bot/pip.
+# =========================================================
+log "Memasang BOT Usage FINAL..."
+
+apt-get install -y python3 >/dev/null 2>&1
+
+cat > /usr/local/bin/usage.py <<'BOT_USAGE_PY_EOF'
+#!/usr/bin/env python3
+import fcntl
+import json
+import logging
+import os
+import re
+import sqlite3
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+
+CONFIG_FILE = "/etc/data/telegram_config.conf"
+DB_PATH = "/var/lib/marzban/db.sqlite3"
+LOCK_FILE = "/run/bot-usage.lock"
+API_TIMEOUT = 45
+POLL_TIMEOUT = 30
+MAX_MESSAGE = 3900
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("bot-usage")
+
+
+def clean_value(value):
+    value = str(value or "").strip().strip("'\"")
+
+    for _ in range(3):
+        old = value
+
+        value = re.sub(
+            r"^(?:botToken|BOT_TOKEN|telegram_bot_token)\s*=\s*",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        )
+        value = re.sub(
+            r"^(?:chatId|CHAT_ID|telegram_chat_id)\s*=\s*",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        )
+
+        value = value.strip().strip("'\"")
+
+        if value == old:
+            break
+
+    return value
+
+
+def load_config():
+    if not os.path.isfile(CONFIG_FILE):
+        raise RuntimeError(
+            f"Konfigurasi Telegram tidak ditemukan: {CONFIG_FILE}"
+        )
+
+    values = {}
+
+    with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip()
+
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            values[key.strip()] = clean_value(value)
+
+    token = clean_value(
+        values.get("BOT_TOKEN")
+        or values.get("botToken")
+        or values.get("API_TOKEN")
+        or values.get("TELEGRAM_BOT_TOKEN")
+    )
+
+    chat_id = clean_value(
+        values.get("CHAT_ID")
+        or values.get("chatId")
+        or values.get("TELEGRAM_CHAT_ID")
+    )
+
+    if not token:
+        raise RuntimeError(
+            "BOT_TOKEN tidak ditemukan di telegram_config.conf"
+        )
+
+    if not chat_id:
+        raise RuntimeError(
+            "CHAT_ID tidak ditemukan di telegram_config.conf"
+        )
+
+    if not re.fullmatch(r"-?\d+", chat_id):
+        raise RuntimeError(
+            "CHAT_ID harus berupa angka murni."
+        )
+
+    if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", token):
+        raise RuntimeError(
+            "BOT_TOKEN tidak valid."
+        )
+
+    return token, chat_id
+
+
+def api_call(token, method, payload=None):
+    url = f"https://api.telegram.org/bot{token}/{method}"
+
+    data = None
+    if payload is not None:
+        data = urllib.parse.urlencode(payload).encode("utf-8")
+
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method="POST" if data is not None else "GET",
+    )
+    request.add_header(
+        "Content-Type",
+        "application/x-www-form-urlencoded",
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=API_TIMEOUT,
+        ) as response:
+            body = response.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+
+        try:
+            result = json.loads(body)
+        except Exception:
+            raise RuntimeError(
+                f"Telegram HTTP {exc.code}: {body[:300]}"
+            )
+
+        raise RuntimeError(
+            result.get(
+                "description",
+                f"Telegram HTTP {exc.code}",
+            )
+        )
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Telegram/network error: {exc}"
+        ) from exc
+
+    try:
+        result = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Respons Telegram bukan JSON yang valid."
+        ) from exc
+
+    if not result.get("ok"):
+        raise RuntimeError(
+            result.get(
+                "description",
+                "Telegram API error",
+            )
+        )
+
+    return result.get("result")
+
+
+def traffic(value):
+    value = int(value or 0)
+
+    if value < 1024 ** 2:
+        return f"{value / 1024:.2f} KB"
+
+    if value < 1024 ** 3:
+        return f"{value / 1024 ** 2:.2f} MB"
+
+    if value < 1024 ** 4:
+        return f"{value / 1024 ** 3:.2f} GB"
+
+    return f"{value / 1024 ** 4:.2f} TB"
+
+
+def expire(value):
+    if not value:
+        return "No Expiration"
+
+    try:
+        return datetime.fromtimestamp(
+            int(value)
+        ).strftime("%d-%m-%Y %H:%M")
+    except (
+        TypeError,
+        ValueError,
+        OSError,
+        OverflowError,
+    ):
+        return "Unknown"
+
+
+def db():
+    if not os.path.isfile(DB_PATH):
+        raise FileNotFoundError(
+            f"Database Marzban tidak ditemukan: {DB_PATH}"
+        )
+
+    return sqlite3.connect(
+        f"file:{DB_PATH}?mode=ro",
+        uri=True,
+        timeout=10,
+    )
+
+
+def get_user(username):
+    con = db()
+
+    try:
+        return con.execute(
+            """
+            SELECT username, used_traffic, status, data_limit, expire
+            FROM users
+            WHERE username = ? COLLATE NOCASE
+            LIMIT 1
+            """,
+            (username,),
+        ).fetchone()
+    finally:
+        con.close()
+
+
+def get_all_users():
+    con = db()
+
+    try:
+        return con.execute(
+            """
+            SELECT username, used_traffic, status, data_limit, expire
+            FROM users
+            ORDER BY username COLLATE NOCASE
+            """
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def format_user(row):
+    username, used, status, limit, expires = row
+
+    data_limit = (
+        "Unlimited"
+        if limit is None or int(limit) == -1
+        else traffic(limit)
+    )
+
+    return (
+        "👤 User Usage\n\n"
+        f"👤 Username : {username}\n"
+        f"📊 Used Traffic : {traffic(used)}\n"
+        f"📋 Status : {status or 'unknown'}\n"
+        f"🔐 Data Limit : {data_limit}\n"
+        f"⏳ Expires At : {expire(expires)}"
+    )
+
+
+def build_all_messages():
+    rows = get_all_users()
+
+    if not rows:
+        return [
+            "🔍 User Usage List\n\nTidak ada user."
+        ]
+
+    messages = []
+    current = [
+        "🔍 User Usage List",
+        "",
+    ]
+
+    for row in rows:
+        part = format_user(row).splitlines() + [""]
+
+        if sum(
+            len(x) + 1
+            for x in current + part
+        ) > MAX_MESSAGE:
+            messages.append(
+                "\n".join(current).rstrip()
+            )
+            current = [
+                "🔍 User Usage List",
+                "",
+            ]
+
+        current.extend(part)
+
+    if len(current) > 2:
+        messages.append(
+            "\n".join(current).rstrip()
+        )
+
+    return messages
+
+
+def send_message(token, chat_id, text):
+    api_call(
+        token,
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": "true",
+        },
+    )
+
+
+def handle_message(
+    token,
+    allowed_chat_id,
+    message,
+):
+    chat = message.get("chat") or {}
+    chat_id = str(chat.get("id", ""))
+
+    if chat_id != allowed_chat_id:
+        return
+
+    text = (message.get("text") or "").strip()
+
+    if not text:
+        return
+
+    command = (
+        text.split()[0]
+        .split("@", 1)[0]
+        .lower()
+    )
+
+    if command == "/start":
+        send_message(
+            token,
+            chat_id,
+            "🤖 Marzban Bot Usage\n\n"
+            "Gunakan:\n"
+            "/cek_usage — semua user\n"
+            "/cek_usage username — usage user tertentu",
+        )
+        return
+
+    if command != "/cek_usage":
+        return
+
+    args = text.split(maxsplit=1)
+
+    try:
+        if len(args) > 1 and args[1].strip():
+            username = args[1].strip()
+            row = get_user(username)
+
+            if row is None:
+                send_message(
+                    token,
+                    chat_id,
+                    f"❌ User '{username}' tidak ditemukan.",
+                )
+                return
+
+            send_message(
+                token,
+                chat_id,
+                format_user(row),
+            )
+            return
+
+        for message_text in build_all_messages():
+            send_message(
+                token,
+                chat_id,
+                message_text,
+            )
+
+    except Exception as exc:
+        log.exception(
+            "Gagal mengambil usage"
+        )
+
+        send_message(
+            token,
+            chat_id,
+            "❌ Gagal mengambil usage: "
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
+def main():
+    lock_fh = open(
+        LOCK_FILE,
+        "w",
+    )
+
+    try:
+        fcntl.flock(
+            lock_fh.fileno(),
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+    except BlockingIOError:
+        raise SystemExit(
+            "BOT Usage sudah berjalan. "
+            "Instance kedua dihentikan."
+        )
+
+    token, allowed_chat_id = load_config()
+
+    me = api_call(
+        token,
+        "getMe",
+    )
+
+    log.info(
+        "Token valid. Bot: @%s",
+        me.get(
+            "username",
+            "unknown",
+        ),
+    )
+
+    api_call(
+        token,
+        "deleteWebhook",
+        {
+            "drop_pending_updates": "false"
+        },
+    )
+
+    log.info("BOT Usage aktif.")
+    log.info("Polling Telegram dimulai.")
+
+    offset = None
+
+    while True:
+        try:
+            payload = {
+                "timeout": POLL_TIMEOUT,
+                "allowed_updates": json.dumps(
+                    ["message"]
+                ),
+            }
+
+            if offset is not None:
+                payload["offset"] = str(offset)
+
+            updates = api_call(
+                token,
+                "getUpdates",
+                payload,
+            ) or []
+
+            for update in updates:
+                try:
+                    offset = (
+                        int(update["update_id"])
+                        + 1
+                    )
+
+                    handle_message(
+                        token,
+                        allowed_chat_id,
+                        update.get("message")
+                        or {},
+                    )
+
+                except Exception:
+                    log.exception(
+                        "Gagal memproses update Telegram"
+                    )
+
+        except KeyboardInterrupt:
+            log.info(
+                "BOT Usage dihentikan."
+            )
+            break
+
+        except Exception as exc:
+            log.error(
+                "Polling error: %s",
+                exc,
+            )
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()
+BOT_USAGE_PY_EOF
+
+chmod 755 /usr/local/bin/usage.py
+
 stage07() {
     set -e
 #install Firewall
@@ -901,8 +1962,6 @@ echo "-=================================-" | tee -a /root/log-install.txt
 echo "Script telah berhasil di install" | tee -a /root/log-install.txt
 # Install script dipertahankan agar --resume tetap tersedia.
 marzban cli admin delete -u admin -y
-read -rp "Reboot sekarang? [y/N]: " answer
-if [[ "$answer" =~ ^[Yy]$ ]]; then reboot; fi
 }
 
 
@@ -911,14 +1970,168 @@ run_stage 02 "Persiapan VPS + paket" stage02
 run_stage 03 "Bootstrap Marzban + Xray" stage03
 run_stage 04 "Profile + VNStat + Speedtest + Gotop" stage04
 run_stage 05 "Nginx + SSL + konfigurasi Xray" stage05
-run_stage 06 "Command LingVPN + BWBOT + cron" stage06
+run_stage 06 "Command LingVPN + Ganti Domain + BWBOT + cron" stage06
 run_stage 07 "Firewall + Fail2ban" stage07
 run_stage 08 "Database + WARP" stage08
 run_stage 09 "Migration database + Admin Marzban" stage09
 run_stage 10 "Token API + finalisasi" stage10
 
+# =========================================================
+# TELEGRAM FINAL SETUP - PALING AKHIR
+# Token + Chat ID baru diminta setelah seluruh stage 01-10 selesai.
+# Config yang sama dipakai BWBOT + menu-backup + BOT Usage.
+# =========================================================
+telegram_final_setup() {
+    mkdir -p /etc/data
+    chmod 700 /etc/data
+
+    local config_file="/etc/data/telegram_config.conf"
+    local tg_bot tg_chat
+
+    echo
+    colorized_echo cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    colorized_echo cyan "        KONFIGURASI TELEGRAM - TAHAP AKHIR"
+    colorized_echo cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Semua instalasi VPS sudah selesai."
+    echo "Sekarang masukkan Bot Token dan Chat ID Telegram."
+    echo
+
+    while true; do
+        read -r -p "Masukkan Telegram Bot Token: " tg_bot
+        tg_bot="${tg_bot#botToken=}"
+        tg_bot="${tg_bot#BOT_TOKEN=}"
+        tg_bot="${tg_bot#TELEGRAM_BOT_TOKEN=}"
+        tg_bot="${tg_bot//$'\r'/}"
+        tg_bot="${tg_bot//$'\n'/}"
+
+        if [[ "$tg_bot" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+            break
+        fi
+        colorized_echo red "[ERROR] Bot Token tidak valid."
+    done
+
+    while true; do
+        read -r -p "Masukkan Telegram Chat ID: " tg_chat
+        tg_chat="${tg_chat#chatId=}"
+        tg_chat="${tg_chat#CHAT_ID=}"
+        tg_chat="${tg_chat#TELEGRAM_CHAT_ID=}"
+        tg_chat="${tg_chat//$'\r'/}"
+        tg_chat="${tg_chat//$'\n'/}"
+
+        if [[ "$tg_chat" =~ ^-?[0-9]+$ ]]; then
+            break
+        fi
+        colorized_echo red "[ERROR] Chat ID harus berupa angka."
+    done
+
+    # Shell-safe config. Semua nama variabel kompatibel dengan script lama/baru.
+    umask 077
+    {
+        printf 'BOT_TOKEN=%q\n' "$tg_bot"
+        printf 'CHAT_ID=%q\n' "$tg_chat"
+        printf 'botToken=%q\n' "$tg_bot"
+        printf 'chatId=%q\n' "$tg_chat"
+        printf 'TELEGRAM_BOT_TOKEN=%q\n' "$tg_bot"
+        printf 'TELEGRAM_CHAT_ID=%q\n' "$tg_chat"
+        printf 'REMARKS=%q\n' ""
+        printf 'button_text=%q\n' "Cek Server"
+        printf 'button_url=%q\n' "https://google.com"
+    } > "$config_file"
+    chmod 600 "$config_file"
+
+    echo
+    colorized_echo green "[✓] Konfigurasi Telegram tersimpan."
+
+    # Validasi token langsung ke Telegram tanpa menampilkan token.
+    local api_result
+    api_result="$(curl -4fsS --connect-timeout 10 --max-time 20 \
+        "https://api.telegram.org/bot${tg_bot}/getMe" 2>/dev/null || true)"
+
+    if printf '%s' "$api_result" | grep -q '"ok":true'; then
+        colorized_echo green "[✓] Bot Token Telegram valid."
+    else
+        colorized_echo yellow "[!] Token tersimpan, tetapi validasi Telegram gagal."
+        echo "    Periksa token atau koneksi internet bila bot belum merespons."
+    fi
+
+    echo
+    colorized_echo green "[✓] Telegram BWBOT + menu-backup + BOT Usage tersinkron."
+}
+
+telegram_final_setup
+
 colorized_echo green "╔════════════════════════════════════════════════════╗"
 colorized_echo green "║       LINGVPN MARZBAN INSTALLATION SELESAI       ║"
 colorized_echo green "╚════════════════════════════════════════════════════╝"
 log "INSTALLATION COMPLETE"
+echo
+read -rp "Reboot sekarang? [y/N]: " answer
+if [[ "$answer" =~ ^[Yy]$ ]]; then reboot; fi
 
+# =========================================================
+# FAIQVPN CHECK_USAGE BOT
+# Telegram token/chat ID memakai /etc/data/telegram_config.conf.
+# Tidak memasang telegram-vps-menu.py / remote menu.
+# =========================================================
+install_check_usage_bot() {
+    local target="/usr/local/bin/usage.py"
+    local service="/etc/systemd/system/check-usage.service"
+
+    if [ ! -f "$target" ]; then
+        colorized_echo yellow "[!] $target tidak ditemukan. BOT Check Usage dilewati."
+        return 0
+    fi
+
+    chmod 755 "$target"
+
+    # Pastikan tidak ada service lama yang menjalankan instance kedua.
+    systemctl disable --now bot-usage.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/bot-usage.service
+    rm -f /usr/local/bin/bot-usage-env
+
+    cat > "$service" <<'CHECK_USAGE_SERVICE_EOF'
+[Unit]
+Description=Telegram Check Usage Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/local/bin
+ExecStart=/usr/bin/python3 /usr/local/bin/usage.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+CHECK_USAGE_SERVICE_EOF
+
+    chmod 644 "$service"
+    systemctl daemon-reload
+    systemctl reset-failed check-usage.service >/dev/null 2>&1 || true
+    systemctl enable check-usage.service >/dev/null 2>&1 || true
+    systemctl restart check-usage.service
+    sleep 2
+
+    if systemctl is-active --quiet check-usage.service; then
+        colorized_echo green "[✓] BOT Check Usage aktif."
+    else
+        colorized_echo yellow "[!] BOT Check Usage gagal aktif."
+        echo "    Cek: journalctl -u check-usage.service -n 50 --no-pager"
+    fi
+}
+
+# Aktifkan BOT Check Usage sebelum installer menawarkan reboot.
+install_check_usage_bot
+
+colorized_echo green "╔════════════════════════════════════════════════════╗"
+colorized_echo green "║       LINGVPN MARZBAN INSTALLATION SELESAI       ║"
+colorized_echo green "╚════════════════════════════════════════════════════╝"
+log "INSTALLATION COMPLETE"
+echo
+echo "Telegram Check Usage: /cek_usage atau /cek_usage username"
+echo "Service: check-usage.service"
+echo
+read -rp "Reboot sekarang? [y/N]: " answer
+if [[ "$answer" =~ ^[Yy]$ ]]; then reboot; fi
