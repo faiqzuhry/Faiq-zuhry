@@ -2,9 +2,10 @@
 
 MARZBAN_DIR="/opt/marzban"
 XRAY_CONF="/opt/marzban/xray.conf"
-CERT_DIR="/var/lib/marzban"
+DEFAULT_CONF="/opt/marzban/default.conf"
 CERT_FILE="/var/lib/marzban/xray.crt"
 KEY_FILE="/var/lib/marzban/xray.key"
+DOMAIN_FILE="/etc/data/domain"
 BACKUP_ROOT="/opt/marzban/domain-backups"
 
 info() {
@@ -28,26 +29,18 @@ die() {
     exit 1
 }
 
-# ============================================================
-# CHECK
-# ============================================================
-
 if [ "$(id -u)" != "0" ]; then
     die "Jalankan sebagai root."
 fi
 
 [ -d "$MARZBAN_DIR" ] || die "$MARZBAN_DIR tidak ditemukan."
-[ -f "$XRAY_CONF" ] || die "$XRAY_CONF tidak ditemukan."
 [ -f "$MARZBAN_DIR/docker-compose.yml" ] || die "docker-compose.yml tidak ditemukan."
 
 command -v docker >/dev/null 2>&1 || die "Docker tidak ditemukan."
 docker compose version >/dev/null 2>&1 || die "Docker Compose tidak tersedia."
 command -v curl >/dev/null 2>&1 || die "curl tidak ditemukan."
-command -v openssl >/dev/null 2>&1 || die "openssl tidak ditemukan."
 
-# ============================================================
-# HEADER
-# ============================================================
+mkdir -p /etc/data "$BACKUP_ROOT"
 
 clear 2>/dev/null
 
@@ -56,55 +49,63 @@ echo "============================================================"
 echo "              MARZBAN DOMAIN CHANGER"
 echo "============================================================"
 echo
-echo "Direktori : /opt/marzban"
-echo
-echo "File yang dipertahankan:"
-echo "  .env"
-echo "  docker-compose.yml"
-echo "  default.conf"
-echo "  nginx.conf"
-echo "  konfigurasi Xray lainnya"
-echo "  WARP / WireProxy"
-echo
-echo "Yang diubah:"
-echo "  xray.conf server_name"
-echo "  xray.crt"
-echo "  xray.key"
-echo
-echo "============================================================"
-echo
 
 # ============================================================
-# CURRENT DOMAIN
+# DOMAIN LAMA
 # ============================================================
 
-CURRENT_DOMAIN=$(grep -m1 '^[[:space:]]*server_name[[:space:]]' "$XRAY_CONF" | \
-    sed -E 's/^[[:space:]]*server_name[[:space:]]+([^;]+);.*/\1/')
+CURRENT_DOMAIN=""
+
+# Prioritas pertama: domain yang sebelumnya disimpan installer.
+if [ -s "$DOMAIN_FILE" ]; then
+    SAVED_DOMAIN=$(tr -d '[:space:]' < "$DOMAIN_FILE")
+
+    if echo "$SAVED_DOMAIN" | grep -Eq \
+        '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'; then
+        CURRENT_DOMAIN="$SAVED_DOMAIN"
+    fi
+fi
+
+# Fallback: cari server_name domain valid dari konfigurasi.
+if [ -z "$CURRENT_DOMAIN" ]; then
+    for CONF in "$DEFAULT_CONF" "$XRAY_CONF" "$MARZBAN_DIR/nginx.conf"; do
+        if [ -f "$CONF" ]; then
+            FOUND=$(grep -Eo \
+                'server_name[[:space:]]+[A-Za-z0-9.-]+\.[A-Za-z]{2,63}' \
+                "$CONF" 2>/dev/null |
+                head -n1 |
+                awk '{print $2}')
+
+            if echo "$FOUND" | grep -Eq \
+                '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'; then
+                CURRENT_DOMAIN="$FOUND"
+                break
+            fi
+        fi
+    done
+fi
 
 echo "Domain saat ini:"
 echo "  ${CURRENT_DOMAIN:-tidak ditemukan}"
 echo
 
 # ============================================================
-# INPUT
+# INPUT DOMAIN BARU
 # ============================================================
 
 read -r -p "Masukkan DOMAIN BARU: " NEW_DOMAIN
 
-NEW_DOMAIN=$(echo "$NEW_DOMAIN" | tr '[:upper:]' '[:lower:]')
-NEW_DOMAIN=${NEW_DOMAIN#http://}
-NEW_DOMAIN=${NEW_DOMAIN#https://}
-NEW_DOMAIN=${NEW_DOMAIN%%/*}
-NEW_DOMAIN=${NEW_DOMAIN%.}
+NEW_DOMAIN=$(printf '%s' "$NEW_DOMAIN" |
+    tr '[:upper:]' '[:lower:]' |
+    sed 's/[[:space:]]//g')
 
-[ -n "$NEW_DOMAIN" ] || die "Domain kosong."
+NEW_DOMAIN="${NEW_DOMAIN#http://}"
+NEW_DOMAIN="${NEW_DOMAIN#https://}"
+NEW_DOMAIN="${NEW_DOMAIN%%/*}"
+NEW_DOMAIN="${NEW_DOMAIN%.}"
 
-case "$NEW_DOMAIN" in
-    *" "*|*"."*.*"")
-        ;;
-esac
-
-if ! echo "$NEW_DOMAIN" | grep -Eq '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'; then
+if ! echo "$NEW_DOMAIN" | grep -Eq \
+    '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'; then
     die "Format domain tidak valid: $NEW_DOMAIN"
 fi
 
@@ -118,7 +119,7 @@ PUBLIC_IP=$(curl -4fsS --max-time 10 https://api.ipify.org 2>/dev/null)
 
 [ -n "$PUBLIC_IP" ] || die "Gagal mendeteksi IP publik VPS."
 
-echo "  IP VPS : $PUBLIC_IP"
+echo "IP VPS : $PUBLIC_IP"
 echo
 
 # ============================================================
@@ -132,7 +133,8 @@ DNS_IP=""
 if command -v dig >/dev/null 2>&1; then
     DNS_IP=$(dig +short A "$NEW_DOMAIN" 2>/dev/null | head -n1)
 elif command -v getent >/dev/null 2>&1; then
-    DNS_IP=$(getent ahostsv4 "$NEW_DOMAIN" 2>/dev/null | awk 'NR==1 {print $1}')
+    DNS_IP=$(getent ahostsv4 "$NEW_DOMAIN" 2>/dev/null |
+        awk 'NR==1 {print $1}')
 else
     DNS_IP=$(curl -4fsS --max-time 10 \
         "https://dns.google/resolve?name=$NEW_DOMAIN&type=A" 2>/dev/null |
@@ -140,310 +142,215 @@ else
         head -n1)
 fi
 
-if [ -z "$DNS_IP" ]; then
-    warn "DNS A record belum ditemukan."
-    echo
-    echo "Pastikan:"
-    echo "  $NEW_DOMAIN"
-    echo "mengarah ke:"
-    echo "  $PUBLIC_IP"
-    echo
-
-    read -r -p "Tetap lanjut? [y/N]: " ANSWER
-
-    [ "$ANSWER" = "y" ] || [ "$ANSWER" = "Y" ] || die "Dibatalkan."
-else
-    echo "  DNS : $DNS_IP"
-    echo
+if [ -n "$DNS_IP" ]; then
+    echo "DNS : $DNS_IP"
 
     if [ "$DNS_IP" = "$PUBLIC_IP" ]; then
         ok "DNS sudah mengarah ke VPS."
     else
-        warn "DNS tidak sama dengan IP VPS."
-        echo "  VPS : $PUBLIC_IP"
-        echo "  DNS : $DNS_IP"
+        warn "DNS berbeda dengan IP VPS."
+        echo "VPS : $PUBLIC_IP"
+        echo "DNS : $DNS_IP"
         echo
 
         read -r -p "Tetap lanjut? [y/N]: " ANSWER
-
-        [ "$ANSWER" = "y" ] || [ "$ANSWER" = "Y" ] || die "Dibatalkan."
+        [[ "$ANSWER" =~ ^[Yy]$ ]] || die "Dibatalkan."
     fi
-fi
+else
+    warn "DNS A record belum ditemukan."
 
-# ============================================================
-# CONFIRM
-# ============================================================
+    read -r -p "Tetap lanjut? [y/N]: " ANSWER
+    [[ "$ANSWER" =~ ^[Yy]$ ]] || die "Dibatalkan."
+fi
 
 echo
 echo "============================================================"
-echo "Domain lama : ${CURRENT_DOMAIN:-unknown}"
+echo "Domain lama : ${CURRENT_DOMAIN:-tidak ditemukan}"
 echo "Domain baru : $NEW_DOMAIN"
 echo "============================================================"
 echo
 
 read -r -p "Lanjut mengganti domain? [y/N]: " CONFIRM
-
-[ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ] || exit 0
+[[ "$CONFIRM" =~ ^[Yy]$ ]] || die "Dibatalkan."
 
 # ============================================================
 # BACKUP
 # ============================================================
 
-DATE_NOW=$(date +%Y%m%d-%H%M%S)
-BACKUP_DIR="$BACKUP_ROOT/$DATE_NOW"
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+BACKUP_DIR="$BACKUP_ROOT/$TIMESTAMP"
 
 mkdir -p "$BACKUP_DIR"
 
-info "Membuat backup..."
-
-cp -a "$XRAY_CONF" "$BACKUP_DIR/xray.conf"
-cp -a "$MARZBAN_DIR/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
-cp -a "$MARZBAN_DIR/default.conf" "$BACKUP_DIR/default.conf"
-
-if [ -f "$MARZBAN_DIR/nginx.conf" ]; then
-    cp -a "$MARZBAN_DIR/nginx.conf" "$BACKUP_DIR/nginx.conf"
-fi
-
-if [ -f "$MARZBAN_DIR/.env" ]; then
-    cp -a "$MARZBAN_DIR/.env" "$BACKUP_DIR/.env"
-fi
-
-if [ -f "$CERT_FILE" ]; then
-    cp -a "$CERT_FILE" "$BACKUP_DIR/xray.crt"
-fi
-
-if [ -f "$KEY_FILE" ]; then
-    cp -a "$KEY_FILE" "$BACKUP_DIR/xray.key"
-fi
+cp -a "$XRAY_CONF" "$BACKUP_DIR/xray.conf" 2>/dev/null || true
+cp -a "$DEFAULT_CONF" "$BACKUP_DIR/default.conf" 2>/dev/null || true
+cp -a "$CERT_FILE" "$BACKUP_DIR/xray.crt" 2>/dev/null || true
+cp -a "$KEY_FILE" "$BACKUP_DIR/xray.key" 2>/dev/null || true
 
 ok "Backup dibuat:"
 echo "  $BACKUP_DIR"
 echo
 
 # ============================================================
-# CERTBOT
+# SIMPAN DOMAIN BARU
 # ============================================================
 
-if ! command -v certbot >/dev/null 2>&1; then
+printf '%s\n' "$NEW_DOMAIN" > "$DOMAIN_FILE"
+chmod 600 "$DOMAIN_FILE"
 
-    info "Certbot belum tersedia."
+ok "Domain baru disimpan ke $DOMAIN_FILE"
 
-    if command -v apt-get >/dev/null 2>&1; then
-        info "Menginstall certbot..."
+# ============================================================
+# UPDATE SERVER_NAME
+# ============================================================
 
-        export DEBIAN_FRONTEND=noninteractive
+info "Mengubah konfigurasi server_name..."
 
-        apt-get update -y
-        apt-get install -y certbot
+update_server_name() {
+    local file="$1"
 
-    else
-        die "Tidak dapat menginstall certbot."
+    [ -f "$file" ] || return 0
+
+    if grep -qE '^[[:space:]]*server_name[[:space:]]+' "$file"; then
+        sed -i -E \
+            "0,/^[[:space:]]*server_name[[:space:]]+[^;]+;/s//server_name $NEW_DOMAIN;/" \
+            "$file"
     fi
-fi
+}
+
+update_server_name "$XRAY_CONF"
+update_server_name "$DEFAULT_CONF"
 
 # ============================================================
 # STOP NGINX
 # ============================================================
 
-info "Menghentikan Nginx sementara..."
-
 cd "$MARZBAN_DIR"
 
-docker compose stop nginx
-
-sleep 3
+info "Menghentikan Nginx sementara..."
+docker compose stop nginx >/dev/null 2>&1 || true
+sleep 2
 
 # ============================================================
-# CHECK PORT 80
+# AUTO FIX-SSL
 # ============================================================
 
-if command -v ss >/dev/null 2>&1; then
+echo
+info "Menjalankan fix-ssl otomatis..."
 
-    PORT80=$(ss -ltn 2>/dev/null | grep -E '[:.]80[[:space:]]' || true)
+if command -v fix-ssl >/dev/null 2>&1; then
 
-    if [ -n "$PORT80" ]; then
-        warn "Port 80 masih digunakan:"
-        echo "$PORT80"
-        die "Port 80 belum bebas."
+    if fix-ssl; then
+        ok "fix-ssl selesai dengan sukses."
+    else
+        warn "fix-ssl gagal."
+
+        # Kembalikan domain file ke domain sebelumnya jika tersedia.
+        if [ -n "$CURRENT_DOMAIN" ]; then
+            printf '%s\n' "$CURRENT_DOMAIN" > "$DOMAIN_FILE"
+        fi
+
+        cp -a "$BACKUP_DIR/xray.conf" "$XRAY_CONF" 2>/dev/null || true
+        cp -a "$BACKUP_DIR/default.conf" "$DEFAULT_CONF" 2>/dev/null || true
+
+        docker compose up -d nginx marzban >/dev/null 2>&1 || true
+
+        die "Domain tidak diterapkan karena SSL gagal."
     fi
 
+else
+    warn "fix-ssl tidak ditemukan."
+    die "fix-ssl wajib tersedia untuk mengganti domain."
 fi
 
 # ============================================================
-# SSL
+# TUNGGU MARZBAN SIAP
 # ============================================================
 
-info "Membuat SSL Let's Encrypt untuk:"
-echo "  $NEW_DOMAIN"
-echo
+info "Menunggu Marzban siap..."
 
-certbot certonly \
-    --standalone \
-    --non-interactive \
-    --agree-tos \
-    --no-eff-email \
-    --preferred-challenges http \
-    --http-01-port 80 \
-    --cert-name "$NEW_DOMAIN" \
-    -d "$NEW_DOMAIN"
+for i in $(seq 1 30); do
+    if ss -lntp 2>/dev/null | grep -q ':12800 '; then
+        break
+    fi
+    sleep 2
+done
 
-LE_CERT="/etc/letsencrypt/live/$NEW_DOMAIN/fullchain.pem"
-LE_KEY="/etc/letsencrypt/live/$NEW_DOMAIN/privkey.pem"
-
-[ -f "$LE_CERT" ] || die "Certificate tidak ditemukan."
-[ -f "$LE_KEY" ] || die "Private key tidak ditemukan."
-
-ok "SSL berhasil dibuat."
-
-# ============================================================
-# COPY SSL
-# ============================================================
-
-info "Memasang SSL ke Marzban..."
-
-cp -L "$LE_CERT" "$CERT_FILE"
-cp -L "$LE_KEY" "$KEY_FILE"
-
-chmod 644 "$CERT_FILE"
-chmod 600 "$KEY_FILE"
-
-ok "SSL terpasang."
-
-# ============================================================
-# CHANGE SERVER_NAME
-# ============================================================
-
-info "Mengubah server_name..."
-
-sed -i -E \
-    "0,/^[[:space:]]*server_name[[:space:]]+[^;]+;/s//            server_name $NEW_DOMAIN;/" \
-    "$XRAY_CONF"
-
-# ============================================================
-# VERIFY SERVER_NAME
-# ============================================================
-
-FINAL_DOMAIN=$(grep -m1 '^[[:space:]]*server_name[[:space:]]' "$XRAY_CONF" | \
-    sed -E 's/^[[:space:]]*server_name[[:space:]]+([^;]+);.*/\1/')
-
-if [ "$FINAL_DOMAIN" != "$NEW_DOMAIN" ]; then
-    warn "server_name gagal diubah."
-
-    cp -a "$BACKUP_DIR/xray.conf" "$XRAY_CONF"
-
-    docker compose up -d nginx marzban
-
-    die "Perubahan dibatalkan."
-fi
-
-ok "server_name sekarang:"
-echo "  $FINAL_DOMAIN"
-echo
-
-# ============================================================
-# DOCKER COMPOSE CHECK
-# ============================================================
-
-info "Validasi Docker Compose..."
-
-docker compose config >/dev/null
-
-ok "Docker Compose valid."
-
-# ============================================================
-# START NGINX
-# ============================================================
-
-info "Menyalakan Nginx..."
-
-docker compose up -d nginx
-
-sleep 3
-
-# ============================================================
-# NGINX TEST
-# ============================================================
-
-info "Memeriksa konfigurasi Nginx..."
-
-if ! docker compose exec -T nginx nginx -t; then
-
-    warn "nginx -t gagal."
-
-    cp -a "$BACKUP_DIR/xray.conf" "$XRAY_CONF"
-    cp -a "$BACKUP_DIR/xray.crt" "$CERT_FILE" 2>/dev/null || true
-    cp -a "$BACKUP_DIR/xray.key" "$KEY_FILE" 2>/dev/null || true
-
-    docker compose restart nginx
-
-    die "Konfigurasi dikembalikan."
-fi
-
-ok "Nginx configuration OK."
-
-# ============================================================
-# START MARZBAN
-# ============================================================
-
-info "Memastikan Marzban aktif..."
-
-docker compose up -d marzban nginx
+# Pastikan container aktif.
+docker compose up -d marzban nginx >/dev/null 2>&1 || true
 
 sleep 5
 
 # ============================================================
-# STATUS
+# AUTO BUAT TOKEN
 # ============================================================
 
 echo
-echo "============================================================"
-echo "                 STATUS MARZBAN"
-echo "============================================================"
+info "Membuat token API otomatis..."
 
-docker compose ps
+if command -v buat_token >/dev/null 2>&1; then
 
-echo
+    TOKEN_OK=0
 
-# ============================================================
-# SSL INFO
-# ============================================================
+    for i in 1 2 3 4 5; do
+        if buat_token >/dev/null 2>&1; then
+            if [ -s /etc/data/token.json ] &&
+               ! grep -q '<html\|404 Not Found' /etc/data/token.json 2>/dev/null; then
+                TOKEN_OK=1
+                break
+            fi
+        fi
 
-echo "============================================================"
-echo "                 INFORMASI SSL"
-echo "============================================================"
+        sleep 3
+    done
 
-openssl x509 \
-    -in "$CERT_FILE" \
-    -noout \
-    -subject \
-    -issuer \
-    -dates 2>/dev/null || true
+    if [ "$TOKEN_OK" = "1" ]; then
+        ok "Token API berhasil dibuat."
+    else
+        warn "Token API belum berhasil dibuat."
+        warn "Jalankan 'buat_token' secara manual jika diperlukan."
+    fi
 
-echo
-
-# ============================================================
-# LOCAL HTTPS TEST
-# ============================================================
-
-info "Mengecek HTTPS lokal..."
-
-HTTP_CODE=$(curl -k \
-    -sS \
-    -o /dev/null \
-    -w "%{http_code}" \
-    --resolve "$NEW_DOMAIN:443:127.0.0.1" \
-    --max-time 10 \
-    "https://$NEW_DOMAIN/" 2>/dev/null || true)
-
-if echo "$HTTP_CODE" | grep -Eq '^[0-9]{3}$'; then
-    ok "HTTPS merespons HTTP $HTTP_CODE"
 else
-    warn "HTTPS belum memberikan response."
+    warn "buat_token tidak ditemukan."
 fi
 
 # ============================================================
-# FINISH
+# FINAL RESTART
 # ============================================================
+
+info "Menjalankan ulang Marzban dan Nginx..."
+
+docker compose up -d marzban nginx >/dev/null 2>&1 || {
+    warn "Gagal menjalankan ulang Marzban/Nginx."
+}
+
+sleep 3
+
+# ============================================================
+# VERIFY DOMAIN
+# ============================================================
+
+echo
+echo "============================================================"
+echo "                 VERIFIKASI DOMAIN"
+echo "============================================================"
+
+STORED_DOMAIN=$(cat "$DOMAIN_FILE" 2>/dev/null)
+
+echo "Domain tersimpan : $STORED_DOMAIN"
+
+if [ "$STORED_DOMAIN" = "$NEW_DOMAIN" ]; then
+    ok "Domain berhasil disimpan."
+else
+    warn "Domain file tidak sesuai."
+fi
+
+if [ -f "$DEFAULT_CONF" ]; then
+    if grep -q "server_name $NEW_DOMAIN;" "$DEFAULT_CONF"; then
+        ok "Nginx server_name sudah menggunakan domain baru."
+    fi
+fi
 
 echo
 echo "============================================================"
@@ -453,13 +360,5 @@ echo
 echo "Domain baru : $NEW_DOMAIN"
 echo "SSL         : $CERT_FILE"
 echo "Backup      : $BACKUP_DIR"
-echo
-echo "Konfigurasi yang dipertahankan:"
-echo "  .env"
-echo "  docker-compose.yml"
-echo "  default.conf"
-echo "  nginx.conf"
-echo "  Xray proxy/location"
-echo "  WARP / WireProxy"
 echo
 echo "============================================================"
