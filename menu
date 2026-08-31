@@ -331,7 +331,7 @@ marzban_menu() {
         select_menu "MARZBAN CONTROL" \
             "Start Marzban" "Stop Marzban" "Restart Marzban" \
             "Status Marzban" "Logs Marzban" "Update Marzban" \
-            "Buat Admin Sudo" "List Admin" "List User"
+            "Buat Admin Sudo" "List Admin" "List User" "Rebuild"
 
         case "$MENU_CHOICE" in
             1) run_cmd "marzban up" ;;
@@ -343,6 +343,19 @@ marzban_menu() {
             7) run_cmd "marzban cli admin create --sudo" ;;
             8) run_cmd "marzban cli admin list" ;;
             9) run_cmd "marzban cli user list" ;;
+            10)
+                cleanup
+                clear
+                if [ -x /usr/local/bin/rebuild ]; then
+                    /usr/local/bin/rebuild
+                else
+                    echo
+                    echo "Error: /usr/local/bin/rebuild tidak ditemukan."
+                    echo "Silakan install file rebuild terlebih dahulu."
+                    echo
+                fi
+                pause_menu
+                ;;
             *) return ;;
         esac
     done
