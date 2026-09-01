@@ -1512,6 +1512,44 @@ marzban cli admin delete -u admin -y || log "WARN: cleanup admin dilewati (exit=
 }
 
 
+
+# =========================================================
+# REBUILD VPS
+# Dipasang sebagai /usr/local/bin/rebuild
+# =========================================================
+install_rebuild() {
+    local target="/usr/local/bin/rebuild"
+    local tmp="${target}.tmp"
+    local url="${sfile}/rebuild"
+
+    colorized_echo cyan "[*] Memasang Rebuild VPS..."
+
+    if ! command -v curl >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1 || true
+        apt-get install -y curl >/dev/null 2>&1 || {
+            colorized_echo yellow "[!] curl tidak tersedia. Rebuild dilewati."
+            return 0
+        }
+    fi
+
+    if curl -4fsSL --retry 3 --connect-timeout 15 --max-time 120 \
+        "$url" -o "$tmp"; then
+        if [ -s "$tmp" ] && bash -n "$tmp" >/dev/null 2>&1; then
+            chmod 755 "$tmp"
+            mv -f "$tmp" "$target"
+            colorized_echo green "[✓] Rebuild VPS terpasang: $target"
+        else
+            rm -f "$tmp"
+            colorized_echo yellow "[!] File Rebuild tidak valid. Instalasi dilanjutkan."
+        fi
+    else
+        rm -f "$tmp"
+        colorized_echo yellow "[!] Gagal mengambil Rebuild. Instalasi dilanjutkan."
+    fi
+}
+
+install_rebuild
+
 run_stage 01 "Validasi OS + input konfigurasi" stage01
 run_stage 02 "Persiapan VPS + paket" stage02
 run_stage 03 "Bootstrap Marzban + Xray" stage03
