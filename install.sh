@@ -3,6 +3,7 @@
 # Support: Debian 11/12/13 + Ubuntu 20.04/22.04
 
 sfile="https://raw.githubusercontent.com/faiqzuhry/Faiq-zuhry/main"
+# TIMEZONE POLICY: NEUTRAL — jangan set timezone berdasarkan IP/lokasi.
 STATE_DIR="/var/lib/lingvpn-install/state"
 LOG_FILE="/root/lingvpn-install.log"
 mkdir -p "$STATE_DIR"
@@ -331,6 +332,13 @@ gem install lolcat;
 
 stage03() {
     set -e
+
+# ===== TIMEZONE NEUTRAL =====
+# Installer tidak mengubah timezone host berdasarkan IP/lokasi.
+# VPS yang sudah UTC tetap UTC; VPS yang sudah Asia/Jakarta tetap Asia/Jakarta.
+# Jangan bind-mount /etc/timezone atau /etc/localtime ke container.
+export TZ="${TZ:-$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || true)}"
+# ===== END TIMEZONE NEUTRAL =====
 #Install Marzban
 # Gunakan script resmi hanya untuk menyiapkan Docker/CLI.
 # Output ditulis ke log agar traceback sementara tidak memenuhi terminal.
@@ -1386,6 +1394,12 @@ EOF
 stage09() {
     set -e
 cd /opt/marzban
+
+# ===== TIMEZONE NEUTRAL =====
+# Jangan mengubah timezone host/container. Hapus bind-mount timezone
+# dari compose agar Docker mengikuti environment tanpa memaksa zona waktu.
+sed -i -e '\\#/etc/timezone#d' -e '\\#/etc/localtime#d' /opt/marzban/docker-compose.yml 2>/dev/null || true
+# ===== END TIMEZONE NEUTRAL =====
 
 # ---------------------------------------------------------
 # Marzban database safety + migration
