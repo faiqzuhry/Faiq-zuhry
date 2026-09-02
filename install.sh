@@ -818,114 +818,131 @@ systemctl restart cron;
 
 
 # =========================================================
-# BOT USAGE - FINAL / STABLE
-# Menggunakan BOT_TOKEN + CHAT_ID yang sama dengan BWBOT/menu-backup.
-# Python 3.12 venv + python-telegram-bot 13.15.
-# Token utama tetap disimpan di /etc/data/telegram_config.conf.
+# BOT USAGE - FINAL
+# Menggunakan BOT_TOKEN + CHAT_ID yang SAMA dengan BWBOT/menu-backup.
+# Tidak memakai python-telegram-bot/pip.
 # =========================================================
-install_bot_usage() {
-    set -e
+log "Memasang BOT Usage FINAL..."
 
+apt-get install -y python3 >/dev/null 2>&1
+
+# ==================== BOT USAGE - FINAL ====================
+install_bot_usage() {
     log "Memasang BOT Usage..."
 
-    apt-get update -qq
-    apt-get install -y python3 python3-venv curl >/dev/null 2>&1
-
-    local target="/usr/local/bin/usage.py"
-    local config="/etc/data/telegram_config.conf"
-    local venv="/opt/bot-usage-venv"
-    local service="/etc/systemd/system/check-usage.service"
     local usage_url="https://raw.githubusercontent.com/faiqzuhry/Faiq-zuhry/main/usage.py"
-    local tmp="/tmp/usage.py.$$"
+    local venv="/opt/bot-usage-venv"
+    local usage_file="/usr/local/bin/usage.py"
+    local config_file="/etc/data/telegram_config.conf"
 
-    # Ambil usage.py dari repo yang sama, dengan validasi dasar.
-    if ! curl -4fsSL --retry 3 --connect-timeout 15 "$usage_url" -o "$tmp"; then
-        rm -f "$tmp"
-        colorized_echo red "[x] Gagal mengambil usage.py dari GitHub."
-        return 1
-    fi
-
-    if [ ! -s "$tmp" ] || ! grep -qE 'from telegram import Update|from telegram import' "$tmp"; then
-        rm -f "$tmp"
-        colorized_echo red "[x] usage.py dari GitHub tidak valid / bukan BOT Usage PTB."
-        return 1
-    fi
-
-    install -m 755 "$tmp" "$target"
-    rm -f "$tmp"
-
-    if [ ! -f "$config" ]; then
-        colorized_echo red "[x] $config tidak ditemukan."
-        return 1
-    fi
-
-    # Pastikan Python 3.12 tersedia untuk PTB 13.15.
-    if ! command -v python3.12 >/dev/null 2>&1; then
-        colorized_echo yellow "[!] Python 3.12 belum tersedia. Memasang dari repository OS..."
-        apt-get install -y python3.12 python3.12-venv >/dev/null 2>&1 || true
-    fi
-
-    command -v python3.12 >/dev/null 2>&1 || {
-        colorized_echo red "[x] Python 3.12 tidak tersedia pada OS ini."
+    # BOT Usage source
+    curl -4fsSL "$usage_url" -o "$usage_file" || {
+        err "Gagal download usage.py dari GitHub."
         return 1
     }
 
-    # Buat ulang venv jika sebelumnya dibuat dengan Python versi yang salah.
-    if [ -x "$venv/bin/python" ]; then
-        if ! "$venv/bin/python" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3,12) else 1)' >/dev/null 2>&1; then
-            rm -rf "$venv"
-        fi
+    grep -q 'from telegram import Update' "$usage_file" || {
+        err "usage.py yang didownload bukan versi yang diharapkan."
+        return 1
+    }
+
+    chmod 755 "$usage_file"
+
+    # uv dipakai agar Python 3.12 tersedia tanpa mengubah Python sistem.
+    if ! command -v uv >/dev/null 2>&1; then
+        log "Memasang uv untuk menyediakan Python 3.12..."
+        curl -4LsSf https://astral.sh/uv/install.sh | sh || {
+            err "Gagal memasang uv."
+            return 1
+        }
     fi
 
-    if [ ! -x "$venv/bin/python" ]; then
-        python3.12 -m venv "$venv"
-    fi
+    export PATH="/root/.local/bin:/usr/local/bin:$PATH"
 
-    "$venv/bin/python" -m pip install --quiet --upgrade "pip<25" "setuptools<81" wheel
+    log "Menyiapkan Python 3.12 untuk BOT Usage..."
+    uv python install 3.12 || {
+        err "Gagal menyediakan Python 3.12."
+        return 1
+    }
 
-    # PTB 13.15 membutuhkan dependency lama yang kompatibel.
-    "$venv/bin/python" -m pip uninstall -y python-telegram-bot urllib3 six >/dev/null 2>&1 || true
-    "$venv/bin/python" -m pip install --quiet --no-cache-dir \
+    rm -rf "$venv"
+    uv venv --python 3.12 --seed "$venv" || {
+        err "Gagal membuat virtual environment BOT Usage."
+        return 1
+    }
+
+    # PTB 13.15 membutuhkan dependency lama tertentu.
+    "$venv/bin/python" -m pip install --no-cache-dir \
+        "pip<25" \
+        "setuptools<81" \
+        wheel \
         "six==1.16.0" \
         "urllib3==1.26.20" \
-        "certifi>=2021.5.30"
-    "$venv/bin/python" -m pip install --quiet --no-cache-dir --no-deps \
-        "python-telegram-bot==13.15"
+        "certifi>=2021.5.30" \
+        "cachetools==4.2.2" \
+        "APScheduler==3.6.3" \
+        "pytz>=2018.6" \
+        "tornado==6.1" || {
+        err "Gagal memasang dependency BOT Usage."
+        return 1
+    }
 
-    # PTB 13.15 kadang membawa vendored urllib3 yang rusak pada Python modern.
-    rm -rf "$venv/lib/python3.12/site-packages/telegram/vendor/ptb_urllib3/urllib3" 2>/dev/null || true
+    "$venv/bin/python" -m pip install --no-cache-dir \
+        "python-telegram-bot==13.15" --no-deps || {
+        err "Gagal memasang python-telegram-bot 13.15."
+        return 1
+    }
 
-    # Ambil konfigurasi yang sama dengan BWBOT/menu-backup.
-    local bot_token chat_id
-    bot_token="$(awk -F= '$1=="BOT_TOKEN" || $1=="API_TOKEN" || $1=="TELEGRAM_BOT_TOKEN" {sub(/^[[:space:]]*/,"",$2); gsub(/\r/,"",$2); gsub(/^["'\'']|["'\'']$/,"",$2); print $2; exit}' "$config")"
-    chat_id="$(awk -F= '$1=="CHAT_ID" || $1=="TELEGRAM_CHAT_ID" || $1=="chatId" {sub(/^[[:space:]]*/,"",$2); gsub(/\r/,"",$2); gsub(/^["'\'']|["'\'']$/,"",$2); print $2; exit}' "$config")"
+    # PTB 13.15 membawa vendored urllib3 yang bermasalah pada environment ini.
+    rm -rf "$venv/lib/python3.12/site-packages/telegram/vendor/ptb_urllib3/urllib3"
 
-    if [ -z "$bot_token" ] || [ -z "$chat_id" ]; then
-        colorized_echo red "[x] BOT_TOKEN/CHAT_ID tidak ditemukan di telegram_config.conf."
+    # Config BOT_TOKEN tetap bersumber dari /etc/data/telegram_config.conf.
+    if [ ! -f "$config_file" ]; then
+        err "$config_file tidak ditemukan. Jalankan telegram_final_setup terlebih dahulu."
         return 1
     fi
 
-    # usage.py lama membaca bot_usage.json.
-    umask 077
+    local bot_token chat_id
+    bot_token="$(grep -m1 '^BOT_TOKEN=' "$config_file" | cut -d= -f2-)"
+    chat_id="$(grep -m1 '^CHAT_ID=' "$config_file" | cut -d= -f2-)"
+
+    if [ -z "$bot_token" ] || [ -z "$chat_id" ]; then
+        err "BOT_TOKEN/CHAT_ID tidak ditemukan di $config_file."
+        return 1
+    fi
+
+    # usage.py lama membaca bot_usage.json secara relatif terhadap WorkingDirectory.
     cat > /usr/local/bin/bot_usage.json <<EOF
 {
   "API_TOKEN": "$bot_token",
-  "BOT_TOKEN": "$bot_token",
   "CHAT_ID": "$chat_id"
 }
 EOF
     chmod 600 /usr/local/bin/bot_usage.json
 
-    # Validasi semua dependency dan syntax sebelum service dibuat.
-    "$venv/bin/python" -c 'import six, urllib3, telegram; print("[✓] six="+six.__version__); print("[✓] urllib3="+urllib3.__version__); print("[✓] telegram="+telegram.__version__)'
-    "$venv/bin/python" -m py_compile "$target"
+    # Validasi dependency dan syntax sebelum service dijalankan.
+    "$venv/bin/python" - <<'PY' || exit 1
+import telegram
+import cachetools
+import apscheduler
+import tornado
+import urllib3
+print("telegram =", telegram.__version__)
+print("cachetools =", cachetools.__version__)
+print("APScheduler =", apscheduler.__version__)
+print("tornado =", tornado.version)
+print("urllib3 =", urllib3.__version__)
+PY
 
-    # Hanya satu instance BOT Usage.
+    "$venv/bin/python" -m py_compile "$usage_file" || {
+        err "usage.py gagal py_compile."
+        return 1
+    }
+
     systemctl disable --now bot-usage.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/bot-usage.service
-    rm -f /usr/local/bin/bot-usage-env
 
-    cat > "$service" <<'CHECK_USAGE_SERVICE_EOF'
+    cat > /etc/systemd/system/check-usage.service <<'EOF'
 [Unit]
 Description=Telegram Check Usage Bot
 After=network-online.target
@@ -941,27 +958,21 @@ RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-CHECK_USAGE_SERVICE_EOF
+EOF
 
-    chmod 644 "$service"
     systemctl daemon-reload
-    systemctl reset-failed check-usage.service >/dev/null 2>&1 || true
     systemctl enable check-usage.service >/dev/null 2>&1
     systemctl restart check-usage.service
     sleep 3
 
     if systemctl is-active --quiet check-usage.service; then
-        colorized_echo green "[✓] BOT Check Usage aktif."
+        ok "BOT Check Usage aktif."
     else
-        colorized_echo red "[x] BOT Check Usage gagal aktif."
+        err "BOT Check Usage gagal aktif."
+        systemctl status check-usage.service --no-pager || true
         journalctl -u check-usage.service -n 30 --no-pager || true
         return 1
     fi
-
-    echo
-    colorized_echo green "[✓] Telegram BWBOT + menu-backup + BOT Usage tersinkron."
-    echo "    Telegram Check Usage: /cek_usage atau /cek_usage username"
-    echo "    Service: check-usage.service"
 }
 
 stage07() {
@@ -1292,7 +1303,6 @@ telegram_final_setup() {
 }
 
 telegram_final_setup
-
 install_bot_usage
 
 colorized_echo green "╔════════════════════════════════════════════════════╗"
@@ -1303,6 +1313,40 @@ echo
 read -rp "Reboot sekarang? [y/N]: " answer
 if [[ "$answer" =~ ^[Yy]$ ]]; then reboot; fi
 
+# =========================================================
+# FAIQVPN CHECK_USAGE BOT
+# Telegram token/chat ID memakai /etc/data/telegram_config.conf.
+# Tidak memasang telegram-vps-menu.py / remote menu.
+# =========================================================
+
+# Aktifkan BOT Check Usage sebelum installer menawarkan reboot.
+
+colorized_echo green "╔════════════════════════════════════════════════════╗"
+colorized_echo green "║       LINGVPN MARZBAN INSTALLATION SELESAI       ║"
+colorized_echo green "╚════════════════════════════════════════════════════╝"
+log "INSTALLATION COMPLETE"
+echo
+echo "Telegram Check Usage: /cek_usage atau /cek_usage username"
+echo "Service: check-usage.service"
+echo
+read -rp "Reboot sekarang? [y/N]: " answer
+if [[ "$answer" =~ ^[Yy]$ ]]; then reboot; fi
+
+colorized_echo green "╔════════════════════════════════════════════════════╗"
+colorized_echo green "║       LINGVPN MARZBAN INSTALLATION SELESAI       ║"
+colorized_echo green "╚════════════════════════════════════════════════════╝"
+log "INSTALLATION COMPLETE"
+echo
+read -rp "Reboot sekarang? [y/N]: " answer
+if [[ "$answer" =~ ^[Yy]$ ]]; then reboot; fi
+
+# =========================================================
+# FAIQVPN CHECK_USAGE BOT
+# Telegram token/chat ID memakai /etc/data/telegram_config.conf.
+# Tidak memasang telegram-vps-menu.py / remote menu.
+# =========================================================
+
+# Aktifkan BOT Check Usage sebelum installer menawarkan reboot.
 
 colorized_echo green "╔════════════════════════════════════════════════════╗"
 colorized_echo green "║       LINGVPN MARZBAN INSTALLATION SELESAI       ║"
