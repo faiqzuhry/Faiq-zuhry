@@ -818,517 +818,25 @@ systemctl restart cron;
 
 
 # =========================================================
-# BOT USAGE - FINAL
-# Menggunakan BOT_TOKEN + CHAT_ID yang SAMA dengan BWBOT/menu-backup.
-# Tidak memakai python-telegram-bot/pip.
+# BOT USAGE - SOURCE FROM GITHUB
+# usage.py dipasang dari repository. Python/venv/service dipasang
+# setelah telegram_final_setup agar token utama tetap di
+# /etc/data/telegram_config.conf.
 # =========================================================
-log "Memasang BOT Usage FINAL..."
-
-apt-get install -y python3 >/dev/null 2>&1
-
-cat > /usr/local/bin/usage.py <<'BOT_USAGE_PY_EOF'
-#!/usr/bin/env python3
-import fcntl
-import json
-import logging
-import os
-import re
-import sqlite3
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from datetime import datetime
-
-CONFIG_FILE = "/etc/data/telegram_config.conf"
-DB_PATH = "/var/lib/marzban/db.sqlite3"
-LOCK_FILE = "/run/bot-usage.lock"
-API_TIMEOUT = 45
-POLL_TIMEOUT = 30
-MAX_MESSAGE = 3900
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("bot-usage")
-
-
-def clean_value(value):
-    value = str(value or "").strip().strip("'\"")
-
-    for _ in range(3):
-        old = value
-
-        value = re.sub(
-            r"^(?:botToken|BOT_TOKEN|telegram_bot_token)\s*=\s*",
-            "",
-            value,
-            flags=re.IGNORECASE,
-        )
-        value = re.sub(
-            r"^(?:chatId|CHAT_ID|telegram_chat_id)\s*=\s*",
-            "",
-            value,
-            flags=re.IGNORECASE,
-        )
-
-        value = value.strip().strip("'\"")
-
-        if value == old:
-            break
-
-    return value
-
-
-def load_config():
-    if not os.path.isfile(CONFIG_FILE):
-        raise RuntimeError(
-            f"Konfigurasi Telegram tidak ditemukan: {CONFIG_FILE}"
-        )
-
-    values = {}
-
-    with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as fh:
-        for raw in fh:
-            line = raw.strip()
-
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-
-            key, value = line.split("=", 1)
-            values[key.strip()] = clean_value(value)
-
-    token = clean_value(
-        values.get("BOT_TOKEN")
-        or values.get("botToken")
-        or values.get("API_TOKEN")
-        or values.get("TELEGRAM_BOT_TOKEN")
-    )
-
-    chat_id = clean_value(
-        values.get("CHAT_ID")
-        or values.get("chatId")
-        or values.get("TELEGRAM_CHAT_ID")
-    )
-
-    if not token:
-        raise RuntimeError(
-            "BOT_TOKEN tidak ditemukan di telegram_config.conf"
-        )
-
-    if not chat_id:
-        raise RuntimeError(
-            "CHAT_ID tidak ditemukan di telegram_config.conf"
-        )
-
-    if not re.fullmatch(r"-?\d+", chat_id):
-        raise RuntimeError(
-            "CHAT_ID harus berupa angka murni."
-        )
-
-    if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", token):
-        raise RuntimeError(
-            "BOT_TOKEN tidak valid."
-        )
-
-    return token, chat_id
-
-
-def api_call(token, method, payload=None):
-    url = f"https://api.telegram.org/bot{token}/{method}"
-
-    data = None
-    if payload is not None:
-        data = urllib.parse.urlencode(payload).encode("utf-8")
-
-    request = urllib.request.Request(
-        url,
-        data=data,
-        method="POST" if data is not None else "GET",
-    )
-    request.add_header(
-        "Content-Type",
-        "application/x-www-form-urlencoded",
-    )
-
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=API_TIMEOUT,
-        ) as response:
-            body = response.read().decode(
-                "utf-8",
-                errors="replace",
-            )
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode(
-            "utf-8",
-            errors="replace",
-        )
-
-        try:
-            result = json.loads(body)
-        except Exception:
-            raise RuntimeError(
-                f"Telegram HTTP {exc.code}: {body[:300]}"
-            )
-
-        raise RuntimeError(
-            result.get(
-                "description",
-                f"Telegram HTTP {exc.code}",
-            )
-        )
-    except urllib.error.URLError as exc:
-        raise RuntimeError(
-            f"Telegram/network error: {exc}"
-        ) from exc
-
-    try:
-        result = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            "Respons Telegram bukan JSON yang valid."
-        ) from exc
-
-    if not result.get("ok"):
-        raise RuntimeError(
-            result.get(
-                "description",
-                "Telegram API error",
-            )
-        )
-
-    return result.get("result")
-
-
-def traffic(value):
-    value = int(value or 0)
-
-    if value < 1024 ** 2:
-        return f"{value / 1024:.2f} KB"
-
-    if value < 1024 ** 3:
-        return f"{value / 1024 ** 2:.2f} MB"
-
-    if value < 1024 ** 4:
-        return f"{value / 1024 ** 3:.2f} GB"
-
-    return f"{value / 1024 ** 4:.2f} TB"
-
-
-def expire(value):
-    if not value:
-        return "No Expiration"
-
-    try:
-        return datetime.fromtimestamp(
-            int(value)
-        ).strftime("%d-%m-%Y %H:%M")
-    except (
-        TypeError,
-        ValueError,
-        OSError,
-        OverflowError,
-    ):
-        return "Unknown"
-
-
-def db():
-    if not os.path.isfile(DB_PATH):
-        raise FileNotFoundError(
-            f"Database Marzban tidak ditemukan: {DB_PATH}"
-        )
-
-    return sqlite3.connect(
-        f"file:{DB_PATH}?mode=ro",
-        uri=True,
-        timeout=10,
-    )
-
-
-def get_user(username):
-    con = db()
-
-    try:
-        return con.execute(
-            """
-            SELECT username, used_traffic, status, data_limit, expire
-            FROM users
-            WHERE username = ? COLLATE NOCASE
-            LIMIT 1
-            """,
-            (username,),
-        ).fetchone()
-    finally:
-        con.close()
-
-
-def get_all_users():
-    con = db()
-
-    try:
-        return con.execute(
-            """
-            SELECT username, used_traffic, status, data_limit, expire
-            FROM users
-            ORDER BY username COLLATE NOCASE
-            """
-        ).fetchall()
-    finally:
-        con.close()
-
-
-def format_user(row):
-    username, used, status, limit, expires = row
-
-    data_limit = (
-        "Unlimited"
-        if limit is None or int(limit) == -1
-        else traffic(limit)
-    )
-
-    return (
-        "👤 User Usage\n\n"
-        f"👤 Username : {username}\n"
-        f"📊 Used Traffic : {traffic(used)}\n"
-        f"📋 Status : {status or 'unknown'}\n"
-        f"🔐 Data Limit : {data_limit}\n"
-        f"⏳ Expires At : {expire(expires)}"
-    )
-
-
-def build_all_messages():
-    rows = get_all_users()
-
-    if not rows:
-        return [
-            "🔍 User Usage List\n\nTidak ada user."
-        ]
-
-    messages = []
-    current = [
-        "🔍 User Usage List",
-        "",
-    ]
-
-    for row in rows:
-        part = format_user(row).splitlines() + [""]
-
-        if sum(
-            len(x) + 1
-            for x in current + part
-        ) > MAX_MESSAGE:
-            messages.append(
-                "\n".join(current).rstrip()
-            )
-            current = [
-                "🔍 User Usage List",
-                "",
-            ]
-
-        current.extend(part)
-
-    if len(current) > 2:
-        messages.append(
-            "\n".join(current).rstrip()
-        )
-
-    return messages
-
-
-def send_message(token, chat_id, text):
-    api_call(
-        token,
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": text,
-            "disable_web_page_preview": "true",
-        },
-    )
-
-
-def handle_message(
-    token,
-    allowed_chat_id,
-    message,
-):
-    chat = message.get("chat") or {}
-    chat_id = str(chat.get("id", ""))
-
-    if chat_id != allowed_chat_id:
-        return
-
-    text = (message.get("text") or "").strip()
-
-    if not text:
-        return
-
-    command = (
-        text.split()[0]
-        .split("@", 1)[0]
-        .lower()
-    )
-
-    if command == "/start":
-        send_message(
-            token,
-            chat_id,
-            "🤖 Marzban Bot Usage\n\n"
-            "Gunakan:\n"
-            "/cek_usage — semua user\n"
-            "/cek_usage username — usage user tertentu",
-        )
-        return
-
-    if command != "/cek_usage":
-        return
-
-    args = text.split(maxsplit=1)
-
-    try:
-        if len(args) > 1 and args[1].strip():
-            username = args[1].strip()
-            row = get_user(username)
-
-            if row is None:
-                send_message(
-                    token,
-                    chat_id,
-                    f"❌ User '{username}' tidak ditemukan.",
-                )
-                return
-
-            send_message(
-                token,
-                chat_id,
-                format_user(row),
-            )
-            return
-
-        for message_text in build_all_messages():
-            send_message(
-                token,
-                chat_id,
-                message_text,
-            )
-
-    except Exception as exc:
-        log.exception(
-            "Gagal mengambil usage"
-        )
-
-        send_message(
-            token,
-            chat_id,
-            "❌ Gagal mengambil usage: "
-            f"{type(exc).__name__}: {exc}",
-        )
-
-
-def main():
-    lock_fh = open(
-        LOCK_FILE,
-        "w",
-    )
-
-    try:
-        fcntl.flock(
-            lock_fh.fileno(),
-            fcntl.LOCK_EX | fcntl.LOCK_NB,
-        )
-    except BlockingIOError:
-        raise SystemExit(
-            "BOT Usage sudah berjalan. "
-            "Instance kedua dihentikan."
-        )
-
-    token, allowed_chat_id = load_config()
-
-    me = api_call(
-        token,
-        "getMe",
-    )
-
-    log.info(
-        "Token valid. Bot: @%s",
-        me.get(
-            "username",
-            "unknown",
-        ),
-    )
-
-    api_call(
-        token,
-        "deleteWebhook",
-        {
-            "drop_pending_updates": "false"
-        },
-    )
-
-    log.info("BOT Usage aktif.")
-    log.info("Polling Telegram dimulai.")
-
-    offset = None
-
-    while True:
-        try:
-            payload = {
-                "timeout": POLL_TIMEOUT,
-                "allowed_updates": json.dumps(
-                    ["message"]
-                ),
-            }
-
-            if offset is not None:
-                payload["offset"] = str(offset)
-
-            updates = api_call(
-                token,
-                "getUpdates",
-                payload,
-            ) or []
-
-            for update in updates:
-                try:
-                    offset = (
-                        int(update["update_id"])
-                        + 1
-                    )
-
-                    handle_message(
-                        token,
-                        allowed_chat_id,
-                        update.get("message")
-                        or {},
-                    )
-
-                except Exception:
-                    log.exception(
-                        "Gagal memproses update Telegram"
-                    )
-
-        except KeyboardInterrupt:
-            log.info(
-                "BOT Usage dihentikan."
-            )
-            break
-
-        except Exception as exc:
-            log.error(
-                "Polling error: %s",
-                exc,
-            )
-            time.sleep(3)
-
-
-if __name__ == "__main__":
-    main()
-BOT_USAGE_PY_EOF
+log "Menyiapkan BOT Usage dari GitHub..."
+
+if ! wget -qO /usr/local/bin/usage.py "$sfile/usage.py"; then
+    colorized_echo red "Gagal mengambil usage.py dari GitHub."
+    exit 1
+fi
+
+if [ ! -s /usr/local/bin/usage.py ]; then
+    colorized_echo red "usage.py kosong/tidak ditemukan."
+    exit 1
+fi
 
 chmod 755 /usr/local/bin/usage.py
+
 
 stage07() {
     set -e
@@ -1521,6 +1029,8 @@ echo "username  : ${userpanel}" | tee -a /root/log-install.txt
 echo "password  : ${passpanel}" | tee -a /root/log-install.txt
 echo "-=================================-" | tee -a /root/log-install.txt
 echo "Script telah berhasil di install" | tee -a /root/log-install.txt
+echo "Telegram Check Usage: /cek_usage atau /cek_usage username" | tee -a /root/log-install.txt
+echo "Service: check-usage.service" | tee -a /root/log-install.txt
 # Install script dipertahankan agar --resume tetap tersedia.
 marzban cli admin delete -u admin -y || log "WARN: cleanup admin dilewati (exit=$?)"
 }
@@ -1580,6 +1090,94 @@ run_stage 10 "Token API + finalisasi" stage10
 # Token + Chat ID baru diminta setelah seluruh stage 01-10 selesai.
 # Config yang sama dipakai BWBOT + menu-backup + BOT Usage.
 # =========================================================
+# =========================================================
+# FAIQVPN CHECK_USAGE BOT - FINAL
+# Python 3.12 + python-telegram-bot 13.15
+# Token utama tetap disimpan di /etc/data/telegram_config.conf.
+# =========================================================
+install_check_usage_bot() {
+    local target="/usr/local/bin/usage.py"
+    local venv="/opt/bot-usage-venv"
+    local service="/etc/systemd/system/check-usage.service"
+    local config="/etc/data/telegram_config.conf"
+
+    [ -s "$target" ] || { colorized_echo yellow "[!] usage.py tidak ditemukan."; return 0; }
+    [ -s "$config" ] || { colorized_echo yellow "[!] telegram_config.conf belum ada."; return 0; }
+
+    colorized_echo cyan "[*] Memasang Python 3.12 untuk BOT Usage..."
+    export PATH="/root/.local/bin:/usr/local/bin:$PATH"
+    if ! command -v uv >/dev/null 2>&1; then
+        if ! curl -LsSf https://astral.sh/uv/install.sh | sh >/tmp/uv-install.log 2>&1; then
+            colorized_echo red "[x] Gagal memasang uv."; tail -30 /tmp/uv-install.log 2>/dev/null || true; return 1
+        fi
+        export PATH="/root/.local/bin:/usr/local/bin:$PATH"
+    fi
+    command -v uv >/dev/null 2>&1 || { colorized_echo red "[x] uv tidak ditemukan."; return 1; }
+
+    rm -rf "$venv"
+    if ! uv venv --python 3.12 --seed "$venv" >/tmp/bot-usage-venv.log 2>&1; then
+        colorized_echo red "[x] Gagal membuat Python 3.12 venv."; tail -30 /tmp/bot-usage-venv.log 2>/dev/null || true; return 1
+    fi
+    if ! "$venv/bin/python" -m pip install --disable-pip-version-check "python-telegram-bot==13.15" >/tmp/bot-usage-pip.log 2>&1; then
+        colorized_echo red "[x] Gagal memasang python-telegram-bot 13.15."; tail -30 /tmp/bot-usage-pip.log 2>/dev/null || true; return 1
+    fi
+    "$venv/bin/python" -c 'import telegram; print(telegram.__version__)' >/tmp/bot-usage-version.log 2>&1 || { colorized_echo red "[x] Modul telegram gagal dimuat."; cat /tmp/bot-usage-version.log 2>/dev/null || true; return 1; }
+    "$venv/bin/python" -m py_compile "$target" || { colorized_echo red "[x] usage.py tidak valid."; return 1; }
+
+    # usage.py lama membaca bot_usage.json dari WorkingDirectory.
+    # Ini hanya salinan runtime; sumber utama tetap telegram_config.conf.
+    local token chat
+    token="$(awk -F= '$1=="BOT_TOKEN"{print substr($0,index($0,"=")+1); exit}' "$config" | sed "s/^['\"]//;s/['\"]$//")"
+    chat="$(awk -F= '$1=="CHAT_ID"{print substr($0,index($0,"=")+1); exit}' "$config" | sed "s/^['\"]//;s/['\"]$//")"
+    [ -n "$token" ] && [ -n "$chat" ] || { colorized_echo red "[x] BOT_TOKEN/CHAT_ID tidak ditemukan di telegram_config.conf."; return 1; }
+
+    umask 077
+    cat > /usr/local/bin/bot_usage.json <<EOF_USAGE_CONFIG
+{
+  "API_TOKEN": "$token",
+  "CHAT_ID": "$chat"
+}
+EOF_USAGE_CONFIG
+    chmod 600 /usr/local/bin/bot_usage.json
+
+    systemctl disable --now bot-usage.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/bot-usage.service /usr/local/bin/bot-usage-env
+
+    cat > "$service" <<'CHECK_USAGE_SERVICE_EOF'
+[Unit]
+Description=Telegram Check Usage Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/local/bin
+ExecStart=/opt/bot-usage-venv/bin/python /usr/local/bin/usage.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+CHECK_USAGE_SERVICE_EOF
+
+    chmod 644 "$service"
+    systemctl daemon-reload
+    systemctl reset-failed check-usage.service >/dev/null 2>&1 || true
+    systemctl enable check-usage.service >/dev/null 2>&1
+    systemctl restart check-usage.service
+    sleep 3
+
+    if systemctl is-active --quiet check-usage.service; then
+        colorized_echo green "[✓] BOT Check Usage aktif."
+        colorized_echo green "[✓] Token utama tetap tersimpan di /etc/data/telegram_config.conf."
+    else
+        colorized_echo red "[x] BOT Check Usage gagal aktif."
+        echo "    journalctl -u check-usage.service -n 50 --no-pager"
+        return 1
+    fi
+}
+
 telegram_final_setup() {
     mkdir -p /etc/data
     chmod 700 /etc/data
@@ -1659,69 +1257,6 @@ telegram_final_setup() {
 
 telegram_final_setup
 
-colorized_echo green "╔════════════════════════════════════════════════════╗"
-colorized_echo green "║       LINGVPN MARZBAN INSTALLATION SELESAI       ║"
-colorized_echo green "╚════════════════════════════════════════════════════╝"
-log "INSTALLATION COMPLETE"
-echo
-read -rp "Reboot sekarang? [y/N]: " answer
-if [[ "$answer" =~ ^[Yy]$ ]]; then reboot; fi
-
-# =========================================================
-# FAIQVPN CHECK_USAGE BOT
-# Telegram token/chat ID memakai /etc/data/telegram_config.conf.
-# Tidak memasang telegram-vps-menu.py / remote menu.
-# =========================================================
-install_check_usage_bot() {
-    local target="/usr/local/bin/usage.py"
-    local service="/etc/systemd/system/check-usage.service"
-
-    if [ ! -f "$target" ]; then
-        colorized_echo yellow "[!] $target tidak ditemukan. BOT Check Usage dilewati."
-        return 0
-    fi
-
-    chmod 755 "$target"
-
-    # Pastikan tidak ada service lama yang menjalankan instance kedua.
-    systemctl disable --now bot-usage.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/bot-usage.service
-    rm -f /usr/local/bin/bot-usage-env
-
-    cat > "$service" <<'CHECK_USAGE_SERVICE_EOF'
-[Unit]
-Description=Telegram Check Usage Bot
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/usr/local/bin
-ExecStart=/usr/bin/python3 /usr/local/bin/usage.py
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-CHECK_USAGE_SERVICE_EOF
-
-    chmod 644 "$service"
-    systemctl daemon-reload
-    systemctl reset-failed check-usage.service >/dev/null 2>&1 || true
-    systemctl enable check-usage.service >/dev/null 2>&1 || true
-    systemctl restart check-usage.service
-    sleep 2
-
-    if systemctl is-active --quiet check-usage.service; then
-        colorized_echo green "[✓] BOT Check Usage aktif."
-    else
-        colorized_echo yellow "[!] BOT Check Usage gagal aktif."
-        echo "    Cek: journalctl -u check-usage.service -n 50 --no-pager"
-    fi
-}
-
-# Aktifkan BOT Check Usage sebelum installer menawarkan reboot.
 install_check_usage_bot
 
 colorized_echo green "╔════════════════════════════════════════════════════╗"
@@ -1729,8 +1264,6 @@ colorized_echo green "║       LINGVPN MARZBAN INSTALLATION SELESAI       ║"
 colorized_echo green "╚════════════════════════════════════════════════════╝"
 log "INSTALLATION COMPLETE"
 echo
-echo "Telegram Check Usage: /cek_usage atau /cek_usage username"
-echo "Service: check-usage.service"
-echo
 read -rp "Reboot sekarang? [y/N]: " answer
 if [[ "$answer" =~ ^[Yy]$ ]]; then reboot; fi
+
