@@ -966,9 +966,9 @@ EOF
     sleep 3
 
     if systemctl is-active --quiet check-usage.service; then
-        ok "BOT Check Usage aktif."
+        echo "ok BOT Check Usage aktif."
     else
-        err "BOT Check Usage gagal aktif."
+        echo "erorr BOT Check Usage gagal aktif."
         systemctl status check-usage.service --no-pager || true
         journalctl -u check-usage.service -n 30 --no-pager || true
         return 1
