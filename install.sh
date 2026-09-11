@@ -1,259 +1,337 @@
 #!/bin/bash
-# Install dependencies and Marzban
-#warna hijau
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
-RED='\033[0;31m'
-PINK='\033[0;35m'
-YELLOW='\033[0;33m'
-INDIGO='\033[38;5;54m'
-CYAN_BG='\033[46;1;97m'
-TEAL='\033[38;5;30m'
-ORANGE='\033[38;5;208m'
-WHITE='\033[0;97m'
+# LingVPN Marzban Installer - Auto Resume
+# Support: Debian 11/12/13 + Ubuntu 20.04/22.04
 
-
-# Safety: installer must run as root and only on supported Debian/Ubuntu.
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}❌ Script harus dijalankan sebagai root.${NC}"
-    exit 1
-fi
-
-if [ ! -f /etc/os-release ]; then
-    echo -e "${RED}❌ /etc/os-release tidak ditemukan.${NC}"
-    exit 1
-fi
-. /etc/os-release
-OS_ID="${ID:-}"
-OS_VERSION="${VERSION_ID:-}"
-case "${OS_ID}:${OS_VERSION}" in
-    debian:11|debian:12|debian:13|ubuntu:20.04|ubuntu:22.04|ubuntu:24.04) ;;
-    *)
-        echo -e "${RED}❌ OS tidak didukung: ${PRETTY_NAME:-unknown}${NC}"
-        echo -e "${YELLOW}Didukung: Debian 11/12/13 atau Ubuntu 20.04/22.04/24.04.${NC}"
-        exit 1
-        ;;
-esac
-
-export DEBIAN_FRONTEND=noninteractive
-
-# Bootstrap only the packages required to continue safely on a fresh VPS.
-apt-get update -y
-apt-get install -y ca-certificates curl gnupg jq iproute2 dnsutils
-echo -e "${TEAL} │${NC} ${CYAN_BG} ♻️ Checking Ticket Masuk... ♻️${NC}"
-sleep 2
-clear
-
-# Install BOT Usage dependencies
-if command -v python3 >/dev/null 2>&1 && [ -f /usr/local/bin/requirements-bot.txt ]; then
-    python3 -m pip install --disable-pip-version-check -r /usr/local/bin/requirements-bot.txt >/dev/null 2>&1 || true
-fi
-
-mkdir -p /etc/data
-
-# Mendapatkan IP publik pengguna
-user_ip=$(curl -fsS --max-time 10 https://ipinfo.io/ip 2>/dev/null || true)
-
-# Meminta nama client dan memvalidasi
-while true; do
-    echo -e "${CYAN} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    read -rp $'\033[38;5;208m ❖ Masukkan Nama Client:\033[0m ' client_name
-
-    # Validasi Nama Client (misalnya tidak kosong dan hanya huruf)
-    if [[ -z "$client_name" ]]; then
-        echo -e "${CYAN} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo " ❖ Nama Client tidak boleh kosong. Silakan masukkan kembali."
-        continue
-    elif [[ ! "$client_name" =~ ^[A-Za-z]+$ ]]; then
-        echo -e "${CYAN} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo " ❖ Nama Client hanya boleh berisi huruf. Silakan masukkan kembali."
-        continue
-    fi
-
-    # Menggunakan curl untuk memeriksa apakah client_name ada dalam file permission.txt
-    permission_file=$(curl -fsSL --max-time 15 https://raw.githubusercontent.com/faiqzuhry/akses-faiq/main/iphost.txt 2>/dev/null || true)
-    if [[ -n "$permission_file" ]] && echo "$permission_file" | grep -Fqi -- "$client_name"; then
-        exp_date=$(echo "$permission_file" | grep -Fi -- "$client_name" | head -n1 | awk '{print $4}')
-        echo -e "${CYAN} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${GREEN} ❖ Succeed, Access Accepted...${NC}"
-        break
-    else
-        echo -e "${CYAN} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${RED} ❖ Sorry brother, Your IP not register.${NC}"
-        echo -e "${CYAN} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${PINK} ❖ Please Contact Dev : @Faiqzuhry.${NC}"
-        rm -f /root/main # Ganti dengan path yang sesuai ke file installer
-        exit 1
-    fi
-done
-
-
-echo -e "${CYAN} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${NC} 🔥 Sedang Melanjutkan proses...${NC}"
-sleep 2
+sfile="https://raw.githubusercontent.com/faiqzuhry/Faiq-zuhry/main"
+# TIMEZONE POLICY: NEUTRAL — jangan set timezone berdasarkan IP/lokasi.
+STATE_DIR="/var/lib/lingvpn-install/state"
+LOG_FILE="/root/lingvpn-install.log"
+mkdir -p "$STATE_DIR"
+touch "$LOG_FILE"
+set -o pipefail
 
 colorized_echo() {
-    local color=$1
-    local text=$2
-    
-    case $color in
-        "red")
-        printf "\e[91m${text}\e[0m\n";;
-        "green")
-        printf "\e[92m${text}\e[0m\n";;
-        "yellow")
-        printf "\e[93m${text}\e[0m\n";;
-        "blue")
-        printf "\e[94m${text}\e[0m\n";;
-        "magenta")
-        printf "\e[95m${text}\e[0m\n";;
-        "cyan")
-        printf "\e[96m${text}\e[0m\n";;
-        *)
-            echo "${text}"
-        ;;
+    local color=$1 text=$2
+    case "$color" in
+        red) printf '\e[91m%s\e[0m\n' "$text";;
+        green) printf '\e[92m%s\e[0m\n' "$text";;
+        yellow) printf '\e[93m%s\e[0m\n' "$text";;
+        blue) printf '\e[94m%s\e[0m\n' "$text";;
+        magenta) printf '\e[95m%s\e[0m\n' "$text";;
+        cyan) printf '\e[96m%s\e[0m\n' "$text";;
+        *) printf '%s\n' "$text";;
     esac
 }
 
-echo -e "${CYAN} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${NC} 🌐 Mengunduh dan menginstal dependensi...${NC}"
-echo -e "${CYAN} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e ""
-sleep 2
+log(){ printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"; }
 
-# Telegram Bot API details
-TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+# Error helper used by optional BOT Usage installer and other non-fatal blocks.
+err(){ colorized_echo red "[ERROR] $*"; }
 
-# Function to send message to Telegram
-send_telegram_message() {
-    MESSAGE=$1
+if [ "$(id -u)" != "0" ]; then
+    colorized_echo red "Error: Skrip ini harus dijalankan sebagai root."
+    exit 1
+fi
 
-    # Telegram notification is optional. Configure these environment
-    # variables only on the VPS; never commit real credentials to GitHub.
-    if [[ -z "${TOKEN:-}" || -z "${CHAT_ID:-}" ]]; then
-        return 0
-    fi
-    BUTTON1_URL="https://t.me/SaputraTech"
-    BUTTON2_URL="https://t.me/SkartiVPN"
-    BUTTON_TEXT1="Admin 😎"
-    BUTTON_TEXT2="Follow 🐳"
+usage(){
+cat <<'USAGE'
+LingVPN Installer
 
-    RESPONSE=$(curl -fsS --max-time 20 -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" \
-        -d chat_id="$CHAT_ID" \
-        -d parse_mode="Markdown" \
-        --data-urlencode text="$MESSAGE" \
-        -d reply_markup='{
-            "inline_keyboard": [
-                [{"text": "'"$BUTTON_TEXT1"'", "url": "'"$BUTTON1_URL"'"}, {"text": "'"$BUTTON_TEXT2"'", "url": "'"$BUTTON2_URL"'"}]
-            ]
-        }')
+Pemakaian:
+  bash /root/install.sh                 # otomatis resume
+  bash /root/install.sh --resume        # lanjut dari checkpoint terakhir
+  bash /root/install.sh --status        # lihat status tahap
+  bash /root/install.sh --reset         # hapus checkpoint, ulang dari awal
 
-    # Jangan menggagalkan installer jika notifikasi Telegram gagal.
-    if command -v jq >/dev/null 2>&1; then echo "$RESPONSE" | jq -r 'if .ok then "Telegram: OK" else "Telegram: gagal" end' 2>/dev/null || true; fi
+Checkpoint disimpan di:
+  /var/lib/lingvpn-install/state/
+
+Log utama:
+  /root/lingvpn-install.log
+USAGE
 }
 
-# Gunakan repository bawaan OS. Repository mirror lama dapat menyebabkan 404,
-# paket tidak sinkron, atau gagal pada Debian/Ubuntu versi baru.
-mkdir -p /etc/data
+case "${1:-}" in
+  --status)
+    echo "=== STATUS INSTALLASI LINGVPN ==="
+    for i in {01..10}; do
+      if [ -f "$STATE_DIR/stage_$i.done" ]; then echo "[✓] Tahap $i selesai"; else echo "[ ] Tahap $i belum selesai"; fi
+    done
+    echo "Log: $LOG_FILE"
+    exit 0
+    ;;
+  --reset)
+    rm -f "$STATE_DIR"/stage_*.done
+    log "Checkpoint di-reset. Instalasi akan dimulai dari tahap 01."
+    ;;
+  --resume|"") ;;
+  -h|--help) usage; exit 0 ;;
+  *) colorized_echo red "Opsi tidak dikenal: $1"; usage; exit 1 ;;
+esac
 
-#domain
-echo -e "${CYAN}❖ ───────────────────────────────────────────── ❖${NC}"
-read -rp "$(echo -e " 🔰 Masukkan Domain ${GREEN}( wajib pointing dulu )${NC}: ")" domain
-if [[ ! "$domain" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
-    echo -e "${RED}❌ Format domain tidak valid.${NC}"
-    exit 1
-fi
-if ! getent ahostsv4 "$domain" >/dev/null 2>&1; then
-    echo -e "${RED}❌ Domain $domain belum bisa di-resolve. Pastikan DNS A record sudah pointing.${NC}"
-    exit 1
-fi
-echo "$domain" > /etc/data/domain
-domain=$(cat /etc/data/domain)
-
-#email
-echo -e "${CYAN} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-while true; do
-    read -rp "$(echo -e " ➣ Masukkan Email anda ${GREEN}( ex: skt@gmail.com )${NC}: ")" email
-    if [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
-        break
+run_stage(){
+    local id="$1" name="$2" func="$3"
+    if [ -f "$STATE_DIR/stage_${id}.done" ]; then
+        colorized_echo green "[✓] Tahap ${id} dilewati: ${name}"
+        return 0
     fi
-    echo -e "${RED}Email tidak valid.${NC}"
-done
-echo "$email" > /etc/data/email
-
-#username
-while true; do
-echo -e "${CYAN} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-read -rp "$(echo -e " ➣ Masukkan Username Panel ${GREEN}( hanya huruf dan angka )${NC}: ")" userpanel
-
-    # Memeriksa apakah userpanel hanya mengandung huruf dan angka
-    if [[ ! "$userpanel" =~ ^[A-Za-z0-9]+$ ]]; then
-        echo "UsernamePanel hanya boleh berisi huruf dan angka. Silakan masukkan kembali."
-    elif [[ "$userpanel" =~ [Aa][Dd][Mm][Ii][Nn] ]]; then
-        echo "UsernamePanel tidak boleh mengandung kata 'admin'. Silakan masukkan kembali."
+    echo
+    colorized_echo cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    colorized_echo cyan "[→] Tahap ${id}/10: ${name}"
+    colorized_echo cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if "$func"; then
+        touch "$STATE_DIR/stage_${id}.done"
+        log "DONE ${id} - ${name}"
+        colorized_echo green "[✓] Tahap ${id} selesai. Checkpoint tersimpan."
     else
-        echo "$userpanel" > /etc/data/userpanel
-        break
+        log "FAILED ${id} - ${name} (exit=$?)"
+        colorized_echo red "[x] Tahap ${id} gagal. Jalankan kembali: bash /root/install.sh --resume"
+        exit 1
     fi
+}
+
+# Safe sysctl: parameter yang tidak tersedia di kernel akan dilewati.
+# Muat kembali konfigurasi tersimpan agar resume melewati input tanpa variabel kosong.
+[ -f /etc/os-release ] && {
+    os_name=$(grep -E '^ID=' /etc/os-release | cut -d= -f2)
+    os_version=$(grep -E '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+}
+for _v in email domain userpanel passpanel nama fileb port choice; do
+    case "$_v" in
+        fileb) _f=/etc/data/passbackup;;
+        choice) _f=/etc/data/ipv6_choice;;
+        *) _f=/etc/data/$_v;;
+    esac
+    if [ -s "$_f" ]; then eval "$_v=\"\$(cat \"$_f\")\""; fi
 done
+unset _v _f
 
-echo -e "${CYAN} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-read -rsp "$(echo -e " ➣ Masukkan Password Panel ${GREEN}( buat dashboard )${NC}: ")" passpanel
-echo
-if [[ ${#passpanel} -lt 8 ]]; then
-    echo -e "${RED}Password minimal 8 karakter.${NC}"
-    exit 1
-fi
-echo "$passpanel" > /etc/data/passpanel
-chmod 600 /etc/data/passpanel
+safe_sysctl_apply(){
+    local key value
+    [ -f /etc/sysctl.conf ] || return 0
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9_.]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+            if sysctl -n "$key" >/dev/null 2>&1; then
+                sysctl -w "$key=$value" >/dev/null 2>&1 || log "WARN sysctl gagal: $key"
+            else
+                log "SKIP sysctl tidak tersedia di kernel: $key"
+            fi
+        fi
+    done < /etc/sysctl.conf
+    return 0
+}
 
-# Function to validate port input
-while true; do
-echo -e "${CYAN} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  read -rp "$(echo -e " ➣ Masukkan Port Dashboard Marzban ${GREEN}(contoh 12800)${NC}: ")" port
+# ===== AUTO SWAP 2GB =====
+# Membuat dan mengaktifkan Swap 2GB pada VPS baru.
+# Aman untuk --resume dan tidak membuat swap kedua jika sudah ada >= 2GB.
 
-  if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1024 || port > 65535 )); then
-    echo -e "${RED}Port harus angka 1024-65535.${NC}"
-  elif [[ "$port" -eq 443 || "$port" -eq 80 ]]; then
-    echo -e "${RED}Port 80/443 dipakai Nginx dan tidak boleh digunakan Marzban.${NC}"
-  else
-    echo "Port yang Anda masukkan adalah: $port"
-    echo "$port" > /etc/data/marzban_port
-    break
-  fi
-done
+setup_swap_2gb(){
+    local SWAPFILE="/swapfile"
+    local SWAP_MB=2048
+    local CURRENT_SWAP_MB=0
 
+    CURRENT_SWAP_MB="$(free -m 2>/dev/null | awk '/^Swap:/ {print $2+0}')"
+
+    # Jika sudah ada Swap >= 2GB, pertahankan konfigurasi yang ada.
+    if [ "${CURRENT_SWAP_MB:-0}" -ge "$SWAP_MB" ]; then
+        colorized_echo green "[✓] Swap >= 2GB sudah tersedia."
+        return 0
+    fi
+
+    # Jika /swapfile ada tetapi tidak aktif/ukurannya salah, buat ulang.
+    if [ -f "$SWAPFILE" ]; then
+        if swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$SWAPFILE"; then
+            colorized_echo green "[✓] /swapfile sudah aktif."
+            return 0
+        fi
+        rm -f "$SWAPFILE"
+    fi
+
+    colorized_echo cyan "[*] Membuat Swap 2GB..."
+
+    if command -v fallocate >/dev/null 2>&1; then
+        fallocate -l 2G "$SWAPFILE" 2>/dev/null || true
+    fi
+
+    # Fallback jika fallocate gagal/tidak tersedia.
+    if [ ! -f "$SWAPFILE" ] || \
+       [ "$(stat -c '%s' "$SWAPFILE" 2>/dev/null || echo 0)" -lt 2147483648 ]; then
+        rm -f "$SWAPFILE"
+        dd if=/dev/zero of="$SWAPFILE" bs=1M count=2048 status=none
+    fi
+
+    chmod 600 "$SWAPFILE"
+
+    if ! mkswap "$SWAPFILE" >/dev/null 2>&1; then
+        colorized_echo yellow "[!] Gagal membuat Swap 2GB."
+        rm -f "$SWAPFILE"
+        return 0
+    fi
+
+    if ! swapon "$SWAPFILE" >/dev/null 2>&1; then
+        colorized_echo yellow "[!] Gagal mengaktifkan Swap 2GB."
+        return 0
+    fi
+
+    # Permanen setelah reboot.
+    if ! grep -qE '^[[:space:]]*/swapfile[[:space:]]+none[[:space:]]+swap([[:space:]]|$)' /etc/fstab 2>/dev/null; then
+        echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    fi
+
+    # Swap hanya dipakai ketika memang diperlukan.
+    if [ -f /etc/sysctl.conf ]; then
+        if grep -qE '^[[:space:]]*vm\.swappiness=' /etc/sysctl.conf; then
+            sed -i 's/^[[:space:]]*vm\.swappiness=.*/vm.swappiness=10/' /etc/sysctl.conf
+        else
+            echo "vm.swappiness=10" >> /etc/sysctl.conf
+        fi
+    else
+        echo "vm.swappiness=10" > /etc/sysctl.conf
+    fi
+
+    sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+
+    colorized_echo green "[✓] Swap 2GB berhasil dibuat dan diaktifkan."
+}
+
+setup_swap_2gb
+
+# ===== END AUTO SWAP 2GB =====
+
+stage01(){
+    local supported_os=false
+    if [ -f /etc/os-release ]; then
+        os_name=$(grep -E '^ID=' /etc/os-release | cut -d= -f2)
+        os_version=$(grep -E '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+        os_codename=$(grep -E '^(VERSION_CODENAME|UBUNTU_CODENAME)=' /etc/os-release | cut -d= -f2 | tr -d '"' | head -n1 || true)
+        if [ "$os_name" = "debian" ] && [[ "$os_version" =~ ^(11|12|13)$ ]]; then supported_os=true; fi
+        if [ "$os_name" = "ubuntu" ] && [[ "$os_version" =~ ^(20\.04|22\.04)$ ]]; then supported_os=true; fi
+    fi
+    if [ "$supported_os" != true ]; then
+        colorized_echo red "OS tidak didukung. Gunakan Debian 11/12/13 atau Ubuntu 20.04/22.04."
+        return 1
+    fi
+    log "OS terdeteksi: $os_name $os_version"
+
+    # Repo functions
+    addDebianRepo(){
+        local v="$1" c
+        case "$v" in 11)c=bullseye;;12)c=bookworm;;13)c=trixie;;*) return 1;; esac
+        cp -a /etc/apt/sources.list "/etc/apt/sources.list.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+        rm -f /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/debian.list 2>/dev/null || true
+        cat > /etc/apt/sources.list.d/debian.sources <<EOF2
+Types: deb
+URIs: http://kartolo.sby.datautama.net.id/debian
+Suites: $c $c-updates
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: http://kartolo.sby.datautama.net.id/debian-security
+Suites: ${c}-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF2
+        : > /etc/apt/sources.list
+    }
+    addUbuntuRepo(){
+        local v="$1" c
+        case "$v" in 20.04)c=focal;;22.04)c=jammy;;*) return 1;; esac
+        cp -a /etc/apt/sources.list "/etc/apt/sources.list.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+        cat > /etc/apt/sources.list <<EOF2
+ deb https://buaya.klas.or.id/ubuntu/ $c main restricted universe multiverse
+ deb https://buaya.klas.or.id/ubuntu/ ${c}-updates main restricted universe multiverse
+ deb https://buaya.klas.or.id/ubuntu/ ${c}-security main restricted universe multiverse
+ deb https://buaya.klas.or.id/ubuntu/ ${c}-backports main restricted universe multiverse
+EOF2
+        sed -i 's/^ //' /etc/apt/sources.list
+    }
+
+    mkdir -p /etc/data
+    if [ -z "${REPO_CHOICE:-}" ]; then
+        COUNTRY_CODE=$(curl -fsS --max-time 10 https://ipinfo.io/country 2>/dev/null || true)
+        if [ "$COUNTRY_CODE" = "ID" ]; then
+            read -rp "Gunakan repo lokal Indonesia? (y/n): " REPO_CHOICE
+        else
+            REPO_CHOICE="n"
+        fi
+        echo "$REPO_CHOICE" > /etc/data/repo_choice
+    fi
+    [ -f /etc/data/repo_choice ] && REPO_CHOICE=$(cat /etc/data/repo_choice)
+    if [[ "$REPO_CHOICE" =~ ^[Yy]$ ]]; then
+        [ "$os_name" = "debian" ] && addDebianRepo "$os_version"
+        [ "$os_name" = "ubuntu" ] && addUbuntuRepo "$os_version"
+    fi
+
+    apt-get update
+    apt-get install -y sudo curl lsb-release ca-certificates
+
+    # Simpan input agar resume tidak bertanya ulang.
+    read_saved(){ local var="$1" prompt="$2" file="$3"; if [ -s "$file" ]; then printf -v "$var" '%s' "$(cat "$file")"; else read -rp "$prompt" val; printf -v "$var" '%s' "$val"; printf '%s' "$val" > "$file"; fi; }
+    # Email ACME dibuat otomatis agar domain tidak pernah salah dipakai sebagai email.
+    # Jika file lama berisi domain / email tidak valid, otomatis diganti.
+    ACME_EMAIL="faiqzuhry@gmail.com"
+    if [ -s /etc/data/email ]; then
+        saved_email="$(tr -d '\r\n' < /etc/data/email)"
+        if [[ "$saved_email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+            email="$saved_email"
+        else
+            email="$ACME_EMAIL"
+            printf '%s\n' "$email" > /etc/data/email
+        fi
+    else
+        email="$ACME_EMAIL"
+        printf '%s\n' "$email" > /etc/data/email
+    fi
+    colorized_echo green "[✓] Email ACME otomatis: ${email}"
+    read_saved domain "Masukkan Domain: " /etc/data/domain
+    while true; do
+        if [ -s /etc/data/userpanel ]; then userpanel=$(cat /etc/data/userpanel); break; fi
+        read -rp "Masukkan UsernamePanel (hanya huruf dan angka): " userpanel
+        if [[ "$userpanel" =~ ^[A-Za-z0-9]+$ ]] && [[ ! "$userpanel" =~ [Aa][Dd][Mm][Ii][Nn] ]]; then echo "$userpanel" >/etc/data/userpanel; break; fi
+        echo "UsernamePanel tidak valid."
+    done
+    read_saved passpanel "Masukkan PasswordPanel: " /etc/data/passpanel
+    read_saved nama "Masukkan ISP VPS: " /etc/data/nama
+    read_saved fileb "Masukkan Pass untuk file Backup: " /etc/data/passbackup
+    while true; do
+        if [ -s /etc/data/port ]; then port=$(cat /etc/data/port); break; fi
+        read -rp "Masukkan Default Port Marzban (selain 443/80): " port
+        if [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) && ((port!=443 && port!=80)); then echo "$port" >/etc/data/port; break; fi
+        echo "Port tidak valid."
+    done
+    # IPv6 otomatis: gunakan "Ya" bila VPS memiliki IPv6 global/route IPv6,
+    # selain itu otomatis "Tidak". Tidak ada pertanyaan interaktif.
+    ipv6_addr="$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/ {print $2; exit}')"
+    ipv6_route="$(ip -6 route show default 2>/dev/null | head -n1)"
+    if [ -n "$ipv6_addr" ] || [ -n "$ipv6_route" ]; then
+        choice="1"
+        colorized_echo green "[✓] IPv6 terdeteksi — otomatis: Ya"
+    else
+        choice="2"
+        colorized_echo yellow "[!] IPv6 tidak terdeteksi — otomatis: Tidak"
+    fi
+    printf '%s\n' "$choice" > /etc/data/ipv6_choice
+
+    wget -q -O /etc/sysctl.conf "$sfile/sysctl.conf" || log "WARN: gagal mengambil sysctl.conf, memakai konfigurasi lama."
+    case "$choice" in
+      1) echo 'net.ipv6.conf.all.forwarding = 1' >> /etc/sysctl.conf; echo 'net.ipv6.conf.default.forwarding = 1' >> /etc/sysctl.conf;;
+      2) echo 'net.ipv6.conf.all.disable_ipv6 = 1' >> /etc/sysctl.conf;;
+    esac
+    safe_sysctl_apply
+    export email domain userpanel passpanel nama fileb port choice os_name os_version os_codename
+}
+
+
+stage02() {
+    set -e
 #Preparation
-#install dependient template bot
 clear
 cd;
-echo -e "${RED}
-██████╗░██╗░░░░░███████╗░█████╗░░██████╗███████╗
-██╔══██╗██║░░░░░██╔════╝██╔══██╗██╔════╝██╔════╝
-██████╔╝██║░░░░░█████╗░░███████║╚█████╗░█████╗░░${NC}${WHITE}
-██╔═══╝░██║░░░░░██╔══╝░░██╔══██║░╚═══██╗██╔══╝░░
-██║░░░░░███████╗███████╗██║░░██║██████╔╝███████╗
-╚═╝░░░░░╚══════╝╚══════╝╚═╝░░╚═╝╚═════╝░╚══════╝
-${NC}"
-echo -e "${WHITE}
-░██╗░░░░░░░██╗░█████╗░██╗████████╗░░░░░░░░░░░░░░░
-░██║░░██╗░░██║██╔══██╗██║╚══██╔══╝░░░░░░░░░░░░░░░
-░╚██╗████╗██╔╝███████║██║░░░██║░░░░░░░░░░░░░░░░░░
-░░████╔═████║░██╔══██║██║░░░██║░░░░░░░░░░░░░░░░░░
-░░╚██╔╝░╚██╔╝░██║░░██║██║░░░██║░░░${NC}${RED}██╗██╗██╗██╗██╗${NC}${WHITE}██╗██╗██╗██╗██╗
-░░░╚═╝░░░╚═╝░░╚═╝░░╚═╝╚═╝░░░╚═╝░░░${NC}${RED}╚═╝╚═╝╚═╝╚═╝╚═╝
-${NC}"
-apt-get update -y >/dev/null 2>&1
-apt-get install figlet toilet lolcat -y >/dev/null 2>&1
-apt-get install ruby -y >/dev/null 2>&1
-# Install lolcat gem without confirmation
-gem install lolcat >/dev/null 2>&1
-apt-get install -y sqlite3 python3 python3-pip python3-venv
-apt-get install -y yq
-# Debian 12/13 may enforce PEP 668. Keep compatibility with the existing BOT scripts.
-python3 -m pip install --break-system-packages --disable-pip-version-check requests==2.31.0 colorama python-telegram-bot==13.7
+apt-get update;
 
 #Remove unused Module
 apt-get -y --purge remove samba*;
@@ -261,806 +339,1479 @@ apt-get -y --purge remove apache2*;
 apt-get -y --purge remove sendmail*;
 apt-get -y --purge remove bind9*;
 
-# Network tuning / BBR (safe on kernels that provide BBR).
-cat > /etc/sysctl.d/99-faiqvpn.conf <<'SYSCTL'
-fs.file-max = 500000
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.netdev_max_backlog = 250000
-net.core.somaxconn = 4096
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_keepalive_time = 1200
-net.ipv4.ip_local_port_range = 10000 65000
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_max_tw_buckets = 5000
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 65536 67108864
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.ip_forward = 1
-net.core.default_qdisc = fq
-SYSCTL
-sysctl --system >/dev/null 2>&1 || true
-if modprobe tcp_bbr 2>/dev/null || grep -qw bbr /proc/sys/net/ipv4/tcp_allowed_congestion_control 2>/dev/null; then
-    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
-fi
+#install benchmark
+wget -O /usr/bin/bench "https://raw.githubusercontent.com/teddysun/across/master/bench.sh" && chmod +x /usr/bin/bench
 
 #install toolkit
-apt-get install libio-socket-inet6-perl libsocket6-perl libcrypt-ssleay-perl libnet-libidn-perl perl libio-socket-ssl-perl libwww-perl libpcre3 libpcre3-dev zlib1g-dev dbus iftop zip unzip wget net-tools curl nano sed screen gnupg gnupg1 bc apt-transport-https build-essential dirmngr dnsutils sudo at htop iptables bsdmainutils cron lsof lnav -y
+sudo apt-get install -y git perl libio-socket-inet6-perl libsocket6-perl libio-socket-ssl-perl libwww-perl zlib1g-dev dbus iftop zip unzip wget net-tools curl ca-certificates nano sed screen gnupg bc build-essential dirmngr dnsutils at htop iptables cron lsof lnav xz-utils
+# Optional compatibility packages (do not abort installation if unavailable).
+apt-get install -y libcrypt-ssleay-perl libnet-libidn-perl libpcre3 libpcre3-dev bsdmainutils apt-transport-https 2>/dev/null || true
 
-# Jangan memaksa timezone server; ikuti timezone OS/VPS yang sudah dikonfigurasi.
+#Install lolcat
+apt-get install -y ruby;
+gem install lolcat;
 
-#Install Marzban
-sudo bash -c "$(curl -fsSL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban.sh)" @ install --version latest
 
-# Reliable downloader: fail on HTTP errors instead of silently installing empty files.
-download_file() {
-    local url="$1" dest="$2"
-    echo -e "${CYAN}↓ ${url}${NC}"
-    if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 180 -o "$dest" "$url"; then
-        echo -e "${RED}❌ Gagal mengunduh: $url${NC}"
-        exit 1
-    fi
-    [[ -s "$dest" ]] || { echo -e "${RED}❌ File kosong: $dest${NC}"; exit 1; }
 }
 
-#Install Subs
-mkdir -p /var/lib/marzban/templates/subscription
-download_file "https://raw.githubusercontent.com/raffasyaa/semvak-subs/master/template-01/index.html" /var/lib/marzban/templates/subscription/index.html
+
+stage03() {
+    set -e
+
+# ===== TIMEZONE NEUTRAL =====
+# Installer tidak mengubah timezone host berdasarkan IP/lokasi.
+# VPS yang sudah UTC tetap UTC; VPS yang sudah Asia/Jakarta tetap Asia/Jakarta.
+# Jangan bind-mount /etc/timezone atau /etc/localtime ke container.
+export TZ="${TZ:-$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || true)}"
+# ===== END TIMEZONE NEUTRAL =====
+#Install Marzban
+# Gunakan script resmi hanya untuk menyiapkan Docker/CLI.
+# Output ditulis ke log agar traceback sementara tidak memenuhi terminal.
+curl -fsSL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban.sh -o /tmp/marzban-install.sh
+
+# Jalankan installer resmi Marzban tanpa follow log foreground.
+# Script resmi menjalankan follow_marzban_logs setelah up_marzban,
+# sehingga instalasi utama akan menunggu Ctrl+C. Di sini hanya pemanggilan
+# follow tersebut di dalam install_command yang dinonaktifkan.
+if [ -s /tmp/marzban-install.sh ]; then
+    awk '
+        /^install_command\(\)/ { in_install=1 }
+        /^install_yq\(\)/ { in_install=0 }
+        in_install && /^[[:space:]]*follow_marzban_logs[[:space:]]*$/ { next }
+        { print }
+    ' /tmp/marzban-install.sh > /tmp/marzban-install.no-follow.sh
+    mv -f /tmp/marzban-install.no-follow.sh /tmp/marzban-install.sh
+fi
+
+if ! bash /tmp/marzban-install.sh install 2>&1 | tee -a /var/log/marzban-bootstrap.log; then
+    colorized_echo yellow "Bootstrap Marzban selesai dengan peringatan. Instalasi utama akan dilanjutkan dengan konfigurasi resmi di bawah."
+fi
+rm -f /tmp/marzban-install.sh
+
+#install subs
+wget -O /opt/marzban/index.html "https://cdn.jsdelivr.net/gh/MuhammadAshouri/marzban-templates@master/template-01/index.html"
 
 #install env
-mkdir -p /opt/marzban
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/env" /opt/marzban/.env
+wget -O /opt/marzban/.env "$sfile/env"
 
-# Use the Xray-core downloaded below instead of the Xray binary bundled in the image.
-# Marzban supports XRAY_EXECUTABLE_PATH for this purpose.
-if grep -q '^XRAY_EXECUTABLE_PATH=' /opt/marzban/.env; then
-    sed -i 's#^XRAY_EXECUTABLE_PATH=.*#XRAY_EXECUTABLE_PATH = "/var/lib/marzban/core/xray"#' /opt/marzban/.env
-else
-    printf '\nXRAY_EXECUTABLE_PATH = "/var/lib/marzban/core/xray"\n' >> /opt/marzban/.env
-fi
+#install compose
+wget -O /opt/marzban/docker-compose.yml "$sfile/docker-compose.yml"
 
-#install core Xray & Assets folder
+# Hapus seluruh bind-mount timezone dari Compose.
+# Timezone host/container tidak dikonfigurasi oleh installer.
+# Ini mencegah error Docker pada /etc/timezone dan /etc/localtime.
+sed -i \
+    -e '\#/etc/timezone#d' \
+    -e '\#/etc/localtime#d' \
+    /opt/marzban/docker-compose.yml
+
+#install assets & core
+mkdir -p /etc/autokill/logs
+mkdir -p /etc/autokill/penalty_logs
 mkdir -p /var/lib/marzban/assets
 mkdir -p /var/lib/marzban/core
-# Install Xray-core dari release terbaru resmi.
-mkdir -p /var/lib/marzban/core
-XRAY_ARCH="64"
-case "$(uname -m)" in
-    x86_64|amd64) XRAY_ARCH="64" ;;
-    aarch64|arm64) XRAY_ARCH="arm64-v8a" ;;
-    armv7l|armv7) XRAY_ARCH="arm32-v7a" ;;
-    armv6l) XRAY_ARCH="arm32-v6" ;;
-    armv5*) XRAY_ARCH="arm32-v5" ;;
-    i386|i686) XRAY_ARCH="32" ;;
-    *) XRAY_ARCH="64" ;;
-esac
-XRAY_LATEST="$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name')"
-if [ -z "$XRAY_LATEST" ] || [ "$XRAY_LATEST" = "null" ]; then
-    echo "Gagal mendapatkan versi Xray terbaru."
-    exit 1
-fi
-XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_LATEST}/Xray-linux-${XRAY_ARCH}.zip"
-download_file "$XRAY_URL" /var/lib/marzban/core/xray.zip
-rm -f /var/lib/marzban/core/xray
-cd /var/lib/marzban/core && unzip -o xray.zip && chmod +x xray
-rm -f xray.zip
-if [ ! -x /var/lib/marzban/core/xray ]; then
-    echo -e "${RED}❌ Xray-core gagal dipasang atau binary tidak ditemukan.${NC}"
-    exit 1
-fi
-printf '%s\n' "$XRAY_LATEST" > /var/lib/marzban/core/VERSION
-cd
 
-# ============================================================
-# XRAY CLOUDFLARE (SEPARATE FROM MARZBAN)
-# Cloudflare -> Nginx :443 -> isolated Xray WS :10010/10011/10012
-#
-# IMPORTANT:
-# - No SSH / Dropbear / WebSocket proxy is installed or modified.
-# - Marzban keeps using its own Xray configuration.
-# - Cloudflare uses a separate Xray config and localhost port.
-# - CloudFront uses a dedicated hostname: cf.${domain}
-# - Main domain remains DNS-only; only cf.${domain} is proxied by Cloudflare.
-# ============================================================
-CF_VMESS_PORT=10010
-CF_VLESS_PORT=10011
-CF_TROJAN_PORT=10012
-CF_DOMAIN="cf.${domain}"
-CF_DIR="/var/lib/marzban/cloudfront"
-CF_CONFIG_FILE="${CF_DIR}/config.json"
-CF_SERVICE="/etc/systemd/system/xray-cloudflare.service"
-
-setup_xray_cloudflare() {
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}Menyiapkan Xray Cloudflare (WS) dari user Marzban...${NC}"
-
-    local CF_DIR="/var/lib/marzban/cloudfront"
-    local CF_CONFIG_FILE="${CF_DIR}/config.json"
-    local CF_SYNC="/usr/local/bin/sync-marzban-cloudfront.py"
-    local CF_SERVICE="/etc/systemd/system/xray-cloudflare.service"
-    local CF_SYNC_SERVICE="/etc/systemd/system/marzban-cloudfront-sync.service"
-    local CF_TIMER="/etc/systemd/system/marzban-cloudfront-sync.timer"
-    local XRAY_BIN="/var/lib/marzban/core/xray"
-
-    mkdir -p "$CF_DIR" /var/log/xray
-    chmod 755 "$CF_DIR"
-
-    if [[ ! -x "$XRAY_BIN" ]]; then
-        echo -e "${RED}❌ Xray-core Marzban tidak ditemukan: $XRAY_BIN${NC}"
+# Install Xray sesuai arsitektur VPS
+XRAY_ARCH="$(uname -m)"
+case "$XRAY_ARCH" in
+    x86_64)
+        XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+        ;;
+    aarch64|arm64)
+        XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm64-v8a.zip"
+        ;;
+    *)
+        colorized_echo red "Arsitektur VPS tidak didukung: $XRAY_ARCH"
         exit 1
-    fi
+        ;;
+esac
 
-    # Generate CloudFront Xray config from the REAL active Marzban users.
-    # No UUID/password is generated here.
-    cat > "$CF_SYNC" <<'PY'
-#!/usr/bin/env python3
-import json, os, sqlite3, tempfile, time
+rm -rf /tmp/xray-install
+mkdir -p /tmp/xray-install
 
-DB = "/var/lib/marzban/db.sqlite3"
-OUT = "/var/lib/marzban/cloudfront/config.json"
-
-def active(expire, status):
-    status = (status or "").lower()
-    if status and status != "active":
-        return False
-    if expire not in (None, 0) and int(expire) <= int(time.time()):
-        return False
-    return True
-
-if not os.path.exists(DB):
-    raise SystemExit("Marzban DB not found: " + DB)
-
-conn = sqlite3.connect(DB)
-conn.row_factory = sqlite3.Row
-try:
-    rows = conn.execute(
-        "SELECT username, proxies, status, expire FROM users"
-    ).fetchall()
-finally:
-    conn.close()
-
-vmess, vless, trojan = [], [], []
-seen = {"vmess": set(), "vless": set(), "trojan": set()}
-
-for row in rows:
-    if not active(row["expire"], row["status"]):
-        continue
-
-    try:
-        proxies = json.loads(row["proxies"] or "{}")
-    except Exception:
-        continue
-
-    p = proxies.get("vmess") or {}
-    uid = p.get("id")
-    if uid and uid not in seen["vmess"]:
-        vmess.append({"id": uid, "alterId": int(p.get("alterId", 0))})
-        seen["vmess"].add(uid)
-
-    p = proxies.get("vless") or {}
-    uid = p.get("id")
-    if uid and uid not in seen["vless"]:
-        vless.append({"id": uid, "email": row["username"] or ""})
-        seen["vless"].add(uid)
-
-    p = proxies.get("trojan") or {}
-    pwd = p.get("password")
-    if pwd and pwd not in seen["trojan"]:
-        trojan.append({"password": pwd, "email": row["username"] or ""})
-        seen["trojan"].add(pwd)
-
-cfg = {
-    "log": {
-        "access": "/var/log/xray/cloudfront-access.log",
-        "error": "/var/log/xray/cloudfront-error.log",
-        "loglevel": "warning"
-    },
-    "inbounds": [
-        {
-            "listen": "127.0.0.1",
-            "port": 10010,
-            "protocol": "vmess",
-            "settings": {"clients": vmess},
-            "streamSettings": {
-                "network": "ws",
-                "security": "none",
-                "wsSettings": {"path": "/vmess-cloudfront"}
-            }
-        },
-        {
-            "listen": "127.0.0.1",
-            "port": 10011,
-            "protocol": "vless",
-            "settings": {"clients": vless, "decryption": "none"},
-            "streamSettings": {
-                "network": "ws",
-                "security": "none",
-                "wsSettings": {"path": "/vless-cloudfront"}
-            }
-        },
-        {
-            "listen": "127.0.0.1",
-            "port": 10012,
-            "protocol": "trojan",
-            "settings": {"clients": trojan},
-            "streamSettings": {
-                "network": "ws",
-                "security": "none",
-                "wsSettings": {"path": "/trojan-cloudfront"}
-            }
-        }
-    ],
-    "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+curl -fL --retry 5 --retry-delay 2 -o /tmp/xray-install/xray.zip "$XRAY_URL" || {
+    colorized_echo red "Gagal download Xray dari sumber resmi."
+    exit 1
 }
 
-os.makedirs(os.path.dirname(OUT), exist_ok=True)
-fd, tmp = tempfile.mkstemp(prefix=".cloudfront-", suffix=".json",
-                           dir=os.path.dirname(OUT))
-with os.fdopen(fd, "w") as f:
-    json.dump(cfg, f, indent=2)
-    f.write("\n")
-os.replace(tmp, OUT)
+unzip -oq /tmp/xray-install/xray.zip xray -d /tmp/xray-install || {
+    colorized_echo red "Gagal extract Xray."
+    exit 1
+}
 
-print(
-    f"CloudFront sync: VMess={len(vmess)} "
-    f"VLESS={len(vless)} Trojan={len(trojan)}"
+if [ ! -s /tmp/xray-install/xray ]; then
+    colorized_echo red "Binary Xray kosong/tidak ditemukan."
+    exit 1
+fi
+
+install -m 755 /tmp/xray-install/xray /var/lib/marzban/core/xray
+rm -rf /tmp/xray-install
+
+/var/lib/marzban/core/xray version >/dev/null 2>&1 || {
+    colorized_echo red "Binary Xray tidak dapat dijalankan. Arsitektur: $XRAY_ARCH"
+    exit 1
+}
+
+colorized_echo green "Xray berhasil dipasang: $XRAY_ARCH"
+
+}
+
+
+stage04() {
+    set -e
+#profile
+echo -e 'profile' >> /root/.profile
+wget -O /usr/bin/profile "$sfile/profile";
+chmod +x /usr/bin/profile
+# Neofetch sudah tidak tersedia pada sebagian release baru (termasuk Debian 13).
+# Gunakan fastfetch jika tersedia; neofetch hanya dipasang bila paket tersedia.
+if apt-cache show neofetch >/dev/null 2>&1; then
+    apt-get install -y neofetch >/dev/null 2>&1 || true
+else
+    apt-get install -y fastfetch >/dev/null 2>&1 || true
+fi
+
+# Profile eksternal dapat memanggil neofetch. Bungkus pemanggilannya agar
+# login tidak menghasilkan "neofetch: command not found".
+if [ -f /usr/bin/profile ]; then
+    sed -i 's/^[[:space:]]*neofetch[[:space:]]*$/command -v neofetch >\/dev\/null 2>\&1 \&\& neofetch || (command -v fastfetch >\/dev\/null 2>\&1 \&\& fastfetch) || true/' /usr/bin/profile
+fi
+
+#Install VNSTAT
+apt -y install vnstat
+systemctl restart vnstat 2>/dev/null || true
+apt -y install libsqlite3-dev
+# Prefer Debian/Ubuntu's packaged vnstat on modern releases.
+# Only fall back to the bundled 2.6 source if the package is unavailable.
+if ! command -v vnstat >/dev/null 2>&1; then
+    apt-get install -y vnstat || {
+        wget -q -O /root/vnstat-2.6.tar.gz "$sfile/vnstat-2.6.tar.gz"
+        tar zxf /root/vnstat-2.6.tar.gz -C /root
+        cd /root/vnstat-2.6
+        ./configure --prefix=/usr --sysconfdir=/etc && make -j"$(nproc)" && make install
+        cd /root
+        rm -rf /root/vnstat-2.6 /root/vnstat-2.6.tar.gz
+    }
+fi
+mkdir -p /var/lib/vnstat
+chown -R vnstat:vnstat /var/lib/vnstat 2>/dev/null || true
+systemctl enable --now vnstat 2>/dev/null || true
+
+#Install Speedtest
+curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | sudo bash
+sudo apt-get install speedtest -y
+
+#install gotop
+rm -rf /tmp/gotop
+git clone --depth 1 https://github.com/cjbassi/gotop /tmp/gotop
+cd /tmp/gotop
+./scripts/download.sh || true
+if [ -f /tmp/gotop/gotop ]; then
+    install -m 755 /tmp/gotop/gotop /usr/bin/gotop
+fi
+cd /root
+
+}
+
+
+stage05() {
+    set -e
+#install nginx
+mkdir -p /var/log/nginx
+touch /var/log/nginx/access.log
+touch /var/log/nginx/error.log
+wget -O /opt/marzban/nginx.conf "$sfile/nginx.conf"
+wget -O /opt/marzban/default.conf "$sfile/vps.conf"
+wget -O /opt/marzban/xray.conf "$sfile/xray.conf"
+# Sinkronkan server_name Xray dengan domain yang dimasukkan saat instalasi.
+domain="$(cat /etc/data/domain 2>/dev/null || printf "")"
+if [ -z "$domain" ]; then echo "ERROR: domain kosong."; exit 1; fi
+if grep -qE '^[[:space:]]*server_name[[:space:]]+[^;]+;' /opt/marzban/xray.conf; then
+    sed -i -E "0,/^[[:space:]]*server_name[[:space:]]+[^;]+;/s//            server_name ${domain};/" /opt/marzban/xray.conf
+else
+    printf '\n            server_name %s;\n' "$domain" >> /opt/marzban/xray.conf
+fi
+mkdir -p /var/www/html
+echo "<pre>Setup by AutoScript LingVPN</pre>" > /var/www/html/index.html
+
+#install socat
+apt install iptables -y
+apt install curl socat xz-utils wget gnupg gnupg2 dnsutils lsb-release -y 
+apt install socat cron bash-completion -y
+
+#install cert
+curl -4fsSL https://get.acme.sh | sh -s email="$email"
+/root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+CF_DOMAIN="cf.${domain}"
+/root/.acme.sh/acme.sh --server letsencrypt --register-account --issue -d "$domain" -d "$CF_DOMAIN" --standalone -k ec-256 --debug
+~/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath /var/lib/marzban/xray.crt --keypath /var/lib/marzban/xray.key --ecc
+wget -O /var/lib/marzban/xray_config.json "$sfile/xray_config.json"
+
+}
+
+
+stage06() {
+    set -e
+#install command
+cd /usr/bin
+#List Trojan
+wget -O addtrws "$sfile/addtrws" && chmod +x addtrws
+wget -O addtrhu "$sfile/addtrhu" && chmod +x addtrhu
+wget -O addtrgrpc "$sfile/addtrgrpc" && chmod +x addtrgrpc
+wget -O addtrojan "$sfile/addtrojan" && chmod +x addtrojan
+#Lits VMess
+wget -O addvmws "$sfile/addvmws" && chmod +x addvmws
+wget -O addvmhu "$sfile/addvmhu" && chmod +x addvmhu
+wget -O addvmgrpc "$sfile/addvmgrpc" && chmod +x addvmgrpc
+wget -O addvmess "$sfile/addvmess" && chmod +x addvmess
+#List VLess
+wget -O addvlws "$sfile/addvlws" && chmod +x addvlws
+wget -O addvlhu "$sfile/addvlhu" && chmod +x addvlhu
+wget -O addvlgrpc "$sfile/addvlgrpc" && chmod +x addvlgrpc
+wget -O addvless "$sfile/addvless" && chmod +x addvless
+#List ShadowSocks
+wget -O addshadow "$sfile/addshadow" && chmod +x addshadow
+wget -O addsso "$sfile/addsso" && chmod +x addsso
+wget -O addssws "$sfile/addssws" && chmod +x addssws
+wget -O addsshu "$sfile/addsshu" && chmod +x addsshu
+wget -O addssgrpc "$sfile/addssgrpc" && chmod +x addssgrpc
+wget -O addtrial "$sfile/addtrial" && chmod +x addtrial
+#Additional
+wget -O status "$sfile/status" && chmod +x status
+wget -qO /usr/bin/menu "$sfile/menu" && chmod 755 /usr/bin/menu
+test -s /usr/bin/menu || { echo "ERROR: file menu kosong/gagal di-download."; exit 1; }
+test -s /usr/bin/menu || { echo "ERROR: file menu kosong/gagal di-download."; exit 1; }
+bash -n /usr/bin/menu || { echo "ERROR: file menu dari repository tidak valid."; exit 1; }
+# Download ganti_domain sebagai file terpisah dari repository.
+wget -qO /usr/bin/ganti_domain "$sfile/ganti_domain" && chmod 755 /usr/bin/ganti_domain
+test -s /usr/bin/ganti_domain || { echo "ERROR: file ganti_domain kosong/gagal di-download."; exit 1; }
+test -s /usr/bin/ganti_domain || { echo "ERROR: file ganti_domain kosong/gagal di-download."; exit 1; }
+bash -n /usr/bin/ganti_domain || { echo "ERROR: file ganti_domain dari repository tidak valid."; exit 1; }
+wget -O ceklogin "$sfile/ceklogin" && chmod +x ceklogin
+wget -O hapus "$sfile/hapus" && chmod +x hapus
+wget -O renew "$sfile/renew" && chmod +x renew
+wget -O resetusage "$sfile/resetusage" && chmod +x resetusage
+wget -O buat_token "$sfile/buat_token" && chmod +x buat_token
+wget -O cekservice "$sfile/cekservice" && chmod +x cekservice
+wget -O ram "$sfile/ram" && chmod +x ram
+wget -O menu-backup "$sfile/menu-backup" && chmod +x menu-backup
+wget -O menu-reboot "$sfile/menu-reboot" && chmod +x menu-reboot
+wget -O menu-akun "$sfile/menu-akun" && chmod +x menu-akun
+wget -O backup "$sfile/backup" && chmod +x backup
+wget -O clearlog "$sfile/clearlog" && chmod +x clearlog
+# Jalankan clearlog otomatis setiap hari pukul 02:00 WIB.
+cat > /etc/cron.d/clearlog_otomatis <<'EOF'
+00 2 * * * root /usr/bin/clearlog >/dev/null 2>&1
+EOF
+chmod 644 /etc/cron.d/clearlog_otomatis
+systemctl restart cron 2>/dev/null || true
+wget -O ceklog "$sfile/ceklog" && chmod +x ceklog
+wget -O cekerror "$sfile/cekerror" && chmod +x cekerror
+wget -O ceknginx "$sfile/ceknginx" && chmod +x ceknginx
+wget -O expired "$sfile/expired" && chmod +x expired
+wget -O setlimit "$sfile/setlimit" && chmod +x setlimit
+wget -O autokill "$sfile/autokill" && chmod +x autokill
+
+# =========================================================
+# Install BWBOT - bandwidth monitor Telegram
+# Aman untuk installer: tidak meminta input, tidak mengubah Marzban,
+# memakai konfigurasi Telegram bersama menu-backup, dan dijalankan 02:00.
+# =========================================================
+cat > /usr/local/bin/bwbot <<'BWBOT_EOF'
+#!/bin/bash
+
+# BWBOT 02AM - CLEAN / SYNC
+# - Public IP otomatis
+# - Telegram config bersama dengan menu-backup
+# - Client/expiry dari permission database
+# - Tidak bergantung pada CRONTAB_ENABLED_FILE
+# - Cron dijadwalkan di /etc/cron.d/bwbot (02:00)
+
+set -u
+
+export RED='\033[0;31m'
+export GREEN='\033[0;32m'
+export YELLOW='\033[0;33m'
+export CYAN='\033[0;36m'
+export PINK='\033[0;35m'
+export ORANGE='\033[38;5;208m'
+export TEAL='\033[38;5;30m'
+export WHITE='\033[1;37m'
+export NC='\033[0m'
+
+CONFIG_FILE="/etc/data/telegram_config.conf"
+PERMISSION_URL="https://raw.githubusercontent.com/faiqzuhry/akses-faiq/main/iphost.txt"
+IPIFY_URL="https://api.ipify.org"
+IPINFO_IP_URL="https://ipinfo.io/ip"
+IPINFO_JSON_BASE="https://ipinfo.io"
+TELEGRAM_API="https://api.telegram.org"
+
+# ---------- Helpers ----------
+die() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+    exit 1
+}
+
+command -v curl >/dev/null 2>&1 || die "curl tidak tersedia."
+command -v jq >/dev/null 2>&1 || die "jq tidak tersedia."
+command -v vnstat >/dev/null 2>&1 || die "vnstat tidak tersedia."
+
+# ---------- Shared Telegram config ----------
+if [[ ! -s "$CONFIG_FILE" ]]; then
+    die "Konfigurasi Telegram belum tersedia. Jalankan menu-backup dan simpan konfigurasi Telegram."
+fi
+
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+BOT_TOKEN="${BOT_TOKEN:-${botToken:-}}"
+CHAT_ID="${CHAT_ID:-${chatId:-}}"
+REMARKS="${REMARKS:-}"
+button_text="${button_text:-Cek Server}"
+button_url="${button_url:-https://google.com}"
+
+[[ -n "$BOT_TOKEN" ]] || die "BOT_TOKEN kosong."
+[[ -n "$CHAT_ID" ]] || die "CHAT_ID kosong."
+[[ -n "$button_text" ]] || button_text="Cek Server"
+[[ -n "$button_url" ]] || button_url="https://google.com"
+
+# ---------- System ----------
+OS=$(lsb_release -ds 2>/dev/null || grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"')
+RAM=$(free -m | awk '/Mem:/ {print $2}')
+UPTIME=$(uptime -p 2>/dev/null || echo "-")
+DOMAIN=$(cat /etc/data/domain 2>/dev/null || echo "-")
+
+# ---------- Public IP ----------
+IP_VPS=$(curl -4fsS --max-time 10 "$IPIFY_URL" 2>/dev/null || true)
+
+if [[ -z "$IP_VPS" ]]; then
+    IP_VPS=$(curl -4fsS --max-time 10 "$IPINFO_IP_URL" 2>/dev/null || true)
+fi
+
+if [[ -z "$IP_VPS" ]]; then
+    IP_VPS=$(hostname -I 2>/dev/null | awk '{print $1}')
+fi
+
+[[ -n "$IP_VPS" ]] || die "Tidak dapat mendeteksi IP VPS."
+
+echo -e "${TEAL}♻️ Detected public IP VPS: ${CYAN}${IP_VPS}${NC}"
+
+# ---------- IP / ISP information ----------
+IP_INFO=$(curl -4fsS --max-time 10 "${IPINFO_JSON_BASE}/${IP_VPS}/json" 2>/dev/null || true)
+
+ISP=$(printf '%s' "$IP_INFO" | jq -r '.org // empty' 2>/dev/null || true)
+REGION=$(printf '%s' "$IP_INFO" | jq -r '.timezone // .region // empty' 2>/dev/null || true)
+IP_COUNTRY=$(printf '%s' "$IP_INFO" | jq -r '.country // empty' 2>/dev/null || true)
+IP_LOC=$(printf '%s' "$IP_INFO" | jq -r '.loc // empty' 2>/dev/null || true)
+
+[[ -n "$ISP" ]] || ISP="Unknown ISP"
+[[ -n "$REGION" ]] || REGION="-"
+
+# ---------- Permission database ----------
+# Hanya satu request. Tidak ada curl dengan URL kosong.
+PERMISSION_FILE=$(curl -4fsS --max-time 10 "$PERMISSION_URL" 2>/dev/null || true)
+
+clientname="Auto IP"
+exp_date="-"
+CLIENT_REGISTERED="no"
+
+if [[ -n "$PERMISSION_FILE" ]]; then
+    CLIENT_INFO=$(printf '%s\n' "$PERMISSION_FILE" |
+        awk -v ip="$IP_VPS" '$1 == ip {print $2 "|" $4; exit}')
+
+    if [[ -n "$CLIENT_INFO" ]]; then
+        IFS='|' read -r clientname exp_date <<< "$CLIENT_INFO"
+        CLIENT_REGISTERED="yes"
+    fi
+fi
+
+# ---------- Expiry ----------
+current_date=$(date +%Y-%m-%d)
+
+if [[ "$exp_date" != "-" && "$exp_date" != "Not Found" && -n "$exp_date" ]]; then
+    if expiry_epoch=$(date -d "$exp_date" +%s 2>/dev/null); then
+        current_epoch=$(date -d "$current_date" +%s)
+
+        if (( expiry_epoch < current_epoch )); then
+            echo -e "${RED}[ INFO ] Script Expired ⛔${NC}"
+            echo -e "${CYAN}Contact admin : ✦ @Faiqzuhry ✦${NC}"
+            exit 1
+        fi
+
+        days_remaining=$(( (expiry_epoch - current_epoch) / 86400 ))
+    else
+        days_remaining="-"
+    fi
+else
+    days_remaining="-"
+fi
+
+# ---------- Bandwidth ----------
+vnstat_output=$(
+    vnstat -y 1 --style 0 2>/dev/null |
+    sed -n 6p |
+    awk '{print "Download :", $2, $3 "\nUpload :", $5, $6 "\nTotal Usage :", $8, $9}'
 )
+
+if [[ -z "$vnstat_output" ]]; then
+    vnstat_output=$'Download : -\nUpload : -\nTotal Usage : -'
+fi
+
+# ---------- Uptime ----------
+uptime_raw="$UPTIME"
+uptime_filtered=$(printf '%s\n' "$uptime_raw" |
+    sed -e 's/.*up *//' \
+        -e 's/minutes/min/g' \
+        -e 's/minute/min/g' \
+        -e 's/hours/hrs/g' \
+        -e 's/hour/hr/g' \
+        -e 's/weeks/week/g' \
+        -e 's/days/day/g' |
+    awk -F, '{print $1 "," $2}')
+
+uptime_final=$(printf '%s' "$uptime_filtered" | sed 's/,$//' | sed 's/^,//')
+[[ -n "$uptime_final" ]] || uptime_final="-"
+
+# ---------- Telegram message ----------
+current_time=$(date +"%d-%m-%Y %I:%M %p")
+button_text_with_emoji="🐳 ${button_text} 🐳"
+
+monospace_message=$(cat <<EOF
+━━━━━━━━━━━━━━━━━━━━━━━
+     🌙 DATA TRAFFIC SERVER 🌙
+━━━━━━━━━━━━━━━━━━━━━━━
+🌐 ISP : <code>${ISP}</code>
+🚀 Status : <code>Active</code>
+⏱ Uptime : <code>${uptime_final}</code>
+🌍 Reg : <code>${REGION}</code>
+➖➖➖➖➖➖➖➖➖➖➖➖
+📥 <code>$(printf '%s\n' "$vnstat_output" | sed -n '1p')</code>
+📤 <code>$(printf '%s\n' "$vnstat_output" | sed -n '2p')</code>
+💼 <code>$(printf '%s\n' "$vnstat_output" | sed -n '3p')</code>
+━━━━━━━━━━━━━━━━━━━━━━━
+  ⚠️ Automatic 02:00 Update ⚠️
+━━━━━━━━━━━━━━━━━━━━━━━
+Last Update : ${current_time}
+━━━━━━━━━━━━━━━━━━━━━━━
+ 🤖 Bot Version 0.23.1
+EOF
+)
+
+keyboard=$(jq -n \
+    --arg text "$button_text_with_emoji" \
+    --arg url "$button_url" \
+    '{inline_keyboard: [[{text: $text, url: $url}]]}')
+
+data=$(jq -n \
+    --arg chat_id "$CHAT_ID" \
+    --arg text "$monospace_message" \
+    --argjson reply_markup "$keyboard" \
+    '{chat_id: $chat_id, text: $text, parse_mode: "HTML", reply_markup: $reply_markup}')
+
+TELEGRAM_URL="${TELEGRAM_API}/bot${BOT_TOKEN}/sendMessage"
+
+if curl -fsS --max-time 20 \
+    -X POST "$TELEGRAM_URL" \
+    -H "Content-Type: application/json" \
+    -d "$data" >/dev/null; then
+
+    echo -e "${CYAN}────────────────────────────────────────────────${NC}"
+    echo -e "${GREEN}❖ Pesan berhasil dikirim ke Telegram.${NC}"
+    echo -e "${CYAN}────────────────────────────────────────────────${NC}"
+else
+    echo -e "${RED}❖ Gagal mengirim pesan ke Telegram.${NC}"
+    exit 1
+fi
+BWBOT_EOF
+chmod 755 /usr/local/bin/bwbot
+
+# Dependensi BWBOT. curl/vnstat sudah dipakai installer; jq diperlukan bot.
+apt-get install -y jq curl vnstat
+
+# Pastikan hanya ada satu jadwal BWBOT dan tidak mengganggu cron lain.
+rm -f /etc/cron.d/bwbot
+cat > /etc/cron.d/bwbot <<'CRON_EOF'
+0 2 * * * root /usr/local/bin/bwbot >/var/log/bwbot.log 2>&1
+CRON_EOF
+chmod 644 /etc/cron.d/bwbot
+
+# Aktifkan cron tanpa menyentuh konfigurasi service lain.
+systemctl enable --now cron 2>/dev/null || systemctl enable --now crond 2>/dev/null || true
+
+log "BWBOT terpasang: /usr/local/bin/bwbot; cron setiap hari 02:00."
+wget -O fix-ssl "$sfile/fix-ssl.sh" && chmod +x fix-ssl
+wget -O ganticore "$sfile/ganticore" && chmod +x ganticore
+wget -O routing "$sfile/routing" && chmod +x routing
+wget -O seeroute "$sfile/seeroute" && chmod +x seeroute
+cd
+
+#Install reboot dan expired otomatis
+wget -O /usr/bin/reboot_otomatis "$sfile/reboot_otomatis.sh";
+chmod +x /usr/bin/reboot_otomatis;
+cat > /etc/cron.d/expired_otomatis <<'EOF'
+00 1 * * * root /usr/bin/expired >/dev/null 2>&1
+EOF
+chmod 644 /etc/cron.d/expired_otomatis;
+systemctl restart cron;
+
+}
+
+
+
+
+# =========================================================
+# BOT USAGE - FINAL
+# Menggunakan BOT_TOKEN + CHAT_ID yang SAMA dengan BWBOT/menu-backup.
+# Menggunakan virtual environment terisolasi untuk python-telegram-bot.
+# =========================================================
+log "Memasang BOT Usage FINAL..."
+
+apt-get install -y python3 >/dev/null 2>&1
+
+# ==================== BOT USAGE - FINAL ====================
+install_bot_usage() {
+    log "Memasang BOT Usage..."
+
+    local usage_url="https://raw.githubusercontent.com/faiqzuhry/Faiq-zuhry/main/usage.py"
+    local venv="/opt/bot-usage-venv"
+    local legacy_venv="/opt/bot-usage-env"
+    local usage_file="/usr/local/bin/usage.py"
+    local config_file="/etc/data/telegram_config.conf"
+
+    # BOT Usage source
+    curl -4fsSL "$usage_url" -o "$usage_file" || {
+        err "Gagal download usage.py dari GitHub."
+        return 1
+    }
+
+    chmod 755 "$usage_file"
+
+    # uv dipakai agar Python 3.12 tersedia tanpa mengubah Python sistem.
+    if ! command -v uv >/dev/null 2>&1; then
+        log "Memasang uv untuk menyediakan Python 3.12..."
+        curl -4LsSf https://astral.sh/uv/install.sh | sh || {
+            err "Gagal memasang uv."
+            return 1
+        }
+    fi
+
+    export PATH="/root/.local/bin:/usr/local/bin:$PATH"
+
+    log "Menyiapkan Python 3.12 untuk BOT Usage..."
+    uv python install 3.12 || {
+        err "Gagal menyediakan Python 3.12."
+        return 1
+    }
+
+    rm -rf "$venv"
+    uv venv --python 3.12 --seed "$venv" || {
+        err "Gagal membuat virtual environment BOT Usage."
+        return 1
+    }
+
+    # Kompatibilitas dengan installer/service lama yang masih memanggil
+    # /opt/bot-usage-env/bin/python. Symlink dibuat SETELAH venv benar-benar ada,
+    # sehingga tidak pernah menghasilkan "No such file or directory".
+    if [ -L "$legacy_venv" ] || [ -e "$legacy_venv" ]; then
+        rm -rf "$legacy_venv"
+    fi
+    ln -s "$venv" "$legacy_venv"
+
+    if [ ! -x "$venv/bin/python" ]; then
+        err "Interpreter BOT Usage tidak ditemukan: $venv/bin/python"
+        return 1
+    fi
+
+    # usage.py diambil dari repository versi terbaru dan dipakai apa adanya.
+    # Installer TIDAK melakukan patch/penyisipan kode ke usage.py.
+
+    # PTB 13.15 membutuhkan dependency lama tertentu.
+    "$venv/bin/python" -m pip install --no-cache-dir \
+        "pip<25" \
+        "setuptools<81" \
+        wheel \
+        "six==1.16.0" \
+        "urllib3==1.26.20" \
+        "certifi>=2021.5.30" \
+        "cachetools==4.2.2" \
+        "APScheduler==3.6.3" \
+        "pytz>=2018.6" \
+        "tornado==6.1" || {
+        err "Gagal memasang dependency BOT Usage."
+        return 1
+    }
+
+    "$venv/bin/python" -m pip install --no-cache-dir \
+        "python-telegram-bot==13.15" --no-deps || {
+        err "Gagal memasang python-telegram-bot 13.15."
+        return 1
+    }
+
+    # PTB 13.15 membawa vendored urllib3 yang bermasalah pada environment ini.
+    rm -rf "$venv/lib/python3.12/site-packages/telegram/vendor/ptb_urllib3/urllib3"
+
+    # Config BOT_TOKEN tetap bersumber dari /etc/data/telegram_config.conf.
+    if [ ! -f "$config_file" ]; then
+        err "$config_file tidak ditemukan. Jalankan telegram_final_setup terlebih dahulu."
+        return 1
+    fi
+
+    local bot_token chat_id
+    bot_token="$(grep -m1 '^BOT_TOKEN=' "$config_file" | cut -d= -f2-)"
+    chat_id="$(grep -m1 '^CHAT_ID=' "$config_file" | cut -d= -f2-)"
+
+    if [ -z "$bot_token" ] || [ -z "$chat_id" ]; then
+        err "BOT_TOKEN/CHAT_ID tidak ditemukan di $config_file."
+        return 1
+    fi
+
+    # usage.py lama membaca bot_usage.json secara relatif terhadap WorkingDirectory.
+    cat > /usr/local/bin/bot_usage.json <<EOF
+{
+  "API_TOKEN": "$bot_token",
+  "CHAT_ID": "$chat_id"
+}
+EOF
+    chmod 600 /usr/local/bin/bot_usage.json
+
+    # Validasi dependency dan syntax sebelum service dijalankan.
+    "$venv/bin/python" - <<'PY' || return 1
+import telegram
+import cachetools
+import apscheduler
+import tornado
+import urllib3
+print("telegram =", telegram.__version__)
+print("cachetools =", cachetools.__version__)
+print("APScheduler =", apscheduler.__version__)
+print("tornado =", tornado.version)
+print("urllib3 =", urllib3.__version__)
 PY
-    chmod 755 "$CF_SYNC"
 
-    python3 "$CF_SYNC" || {
-        echo -e "${RED}❌ Gagal membaca user Marzban.${NC}"
-        exit 1
+    "$venv/bin/python" -m py_compile "$usage_file" || {
+        err "usage.py gagal py_compile."
+        return 1
     }
 
-    "$XRAY_BIN" run -test -config "$CF_CONFIG_FILE" >/tmp/xray-cloudfront-test.log 2>&1 || {
-        cat /tmp/xray-cloudfront-test.log
-        echo -e "${RED}❌ Config Xray CloudFront tidak valid.${NC}"
-        exit 1
+    # Verifikasi juga path legacy yang muncul pada installer lama.
+    "$legacy_venv/bin/python" --version >/dev/null 2>&1 || {
+        err "Compatibility interpreter BOT Usage gagal: $legacy_venv/bin/python"
+        return 1
     }
 
-    cat > "$CF_SERVICE" <<EOF
+    systemctl disable --now bot-usage.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/bot-usage.service
+
+    cat > /etc/systemd/system/check-usage.service <<'EOF'
 [Unit]
-Description=Xray CloudFront WS - Marzban Users
-After=network-online.target docker.service
+Description=Telegram Check Usage Bot
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${XRAY_BIN} run -config ${CF_CONFIG_FILE}
+User=root
+WorkingDirectory=/usr/local/bin
+ExecStart=/opt/bot-usage-venv/bin/python /usr/local/bin/usage.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable check-usage.service >/dev/null 2>&1
+    systemctl restart check-usage.service
+    sleep 3
+
+    if systemctl is-active --quiet check-usage.service; then
+        log "[✓] BOT Check Usage aktif."
+    else
+        err "BOT Check Usage gagal aktif."
+        systemctl status check-usage.service --no-pager || true
+        journalctl -u check-usage.service -n 30 --no-pager || true
+        return 1
+    fi
+}
+
+stage07() {
+    set -e
+#install Firewall
+apt install ufw -y
+apt install fail2ban -y
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow ssh
+sudo ufw allow http
+sudo ufw allow https
+sudo ufw allow 1080/tcp
+sudo ufw allow 2082/tcp
+sudo ufw allow 2083/tcp
+sudo ufw allow 3128/tcp
+sudo ufw allow 8080/tcp
+sudo ufw allow 8443/tcp
+sudo ufw allow 8880/tcp
+sudo ufw allow 8081/tcp
+sudo ufw allow $port/tcp
+yes | sudo ufw enable
+systemctl enable ufw
+systemctl start ufw
+
+}
+
+
+stage08() {
+    set -e
+#install database
+wget -O /var/lib/marzban/db.sqlite3 "$sfile/db.sqlite3"
+
+#install warp
+wget -O /root/warp "https://raw.githubusercontent.com/hamid-gh98/x-ui-scripts/main/install_warp_proxy.sh"
+sudo chmod +x /root/warp
+sudo bash /root/warp -y
+rm /root/warp
+
+#finishing
+apt autoremove -y
+apt clean
+
+
+}
+
+
+
+# Logrotate Marzban
+mkdir -p /etc/logrotate.d
+cat > /etc/logrotate.d/marzban <<'EOF'
+/var/lib/marzban/assets/*.log {
+    daily
+    rotate 7
+    size 50M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+
+
+stage09() {
+    set -e
+cd /opt/marzban
+
+# ===== TIMEZONE NEUTRAL =====
+# Jangan mengubah timezone host/container. Hapus bind-mount timezone
+# dari compose agar Docker mengikuti environment tanpa memaksa zona waktu.
+sed -i -e '\\#/etc/timezone#d' -e '\\#/etc/localtime#d' /opt/marzban/docker-compose.yml 2>/dev/null || true
+# ===== END TIMEZONE NEUTRAL =====
+
+# ---------------------------------------------------------
+# Marzban database safety + migration
+# Mencegah error: sqlite3.OperationalError: no such column: admins.users_usage
+# ---------------------------------------------------------
+if [ ! -f /opt/marzban/.env ] || [ ! -f /opt/marzban/docker-compose.yml ]; then
+    colorized_echo red "File konfigurasi Marzban tidak lengkap."
+    return 1
+fi
+
+# Pastikan Compose yang dipakai migration bersih dari konfigurasi timezone.
+# Ini juga memperbaiki instalasi lama saat --resume langsung masuk ke Stage 09.
+sed -i \
+    -e '\#/etc/timezone#d' \
+    -e '\#/etc/localtime#d' \
+    /opt/marzban/docker-compose.yml
+
+# Pastikan image panel dan migration berasal dari upstream Marzban yang sama.
+# Ini mencegah compose custom lama menjalankan kode baru dengan schema lama.
+if grep -qE 'image:[[:space:]]*gozargah/marzban:' /opt/marzban/docker-compose.yml; then
+    sed -i -E 's#(image:[[:space:]]*gozargah/marzban:)[^[:space:]]+#\1latest#' /opt/marzban/docker-compose.yml
+fi
+
+# Migration tanpa membuat backup database otomatis sebelum migration.
+DB_BACKUP=""
+
+# Set kredensial sementara untuk import admin.
+sed -i "s/# SUDO_USERNAME = \"admin\"/SUDO_USERNAME = \"${userpanel}\"/" /opt/marzban/.env
+sed -i "s/# SUDO_PASSWORD = \"admin\"/SUDO_PASSWORD = \"${passpanel}\"/" /opt/marzban/.env
+sed -i "s/UVICORN_PORT = 7879/UVICORN_PORT = ${port}/" /opt/marzban/.env
+
+if docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_CMD="docker-compose"
+else
+    colorized_echo red "Docker Compose tidak ditemukan."
+    return 1
+fi
+
+# Pastikan image Marzban v0.8.4 tersedia sebelum migration.
+# Pull langsung dibuat eksplisit agar kegagalan tidak tersembunyi.
+MARZBAN_IMAGE="gozargah/marzban:latest"
+colorized_echo cyan "Mengambil image ${MARZBAN_IMAGE}..."
+if ! docker pull "${MARZBAN_IMAGE}" >> /var/log/marzban-bootstrap.log 2>&1; then
+    colorized_echo red "Gagal mengambil image Marzban ${MARZBAN_IMAGE}."
+    echo "===== docker pull error ====="
+    tail -n 80 /var/log/marzban-bootstrap.log || true
+    return 1
+fi
+
+# Pastikan compose menunjuk ke image yang benar-benar tersedia.
+sed -i -E 's#(image:[[:space:]]*gozargah/marzban:)[^[:space:]]+#\1latest#' /opt/marzban/docker-compose.yml
+
+# Jalankan Alembic SEBELUM panel dijalankan.
+# Dengan demikian query admin baru tidak dieksekusi pada schema lama.
+colorized_echo cyan "Menjalankan database migration Marzban..."
+if ! $COMPOSE_CMD run --rm --no-deps --entrypoint alembic marzban upgrade head; then
+    colorized_echo yellow "Perintah alembic langsung gagal, mencoba Python module alembic..."
+    if ! $COMPOSE_CMD run --rm --no-deps --entrypoint python marzban -m alembic upgrade head; then
+        colorized_echo red "Migration database Marzban gagal."
+        return 1
+    fi
+fi
+
+colorized_echo green "Database migration Marzban berhasil."
+
+# Baru jalankan panel setelah schema selesai dimigrasikan.
+$COMPOSE_CMD up -d --remove-orphans
+
+# Tunggu container sehat sebelum import admin.
+for i in $(seq 1 30); do
+    if $COMPOSE_CMD ps --status running 2>/dev/null | grep -q marzban; then
+        break
+    fi
+    sleep 2
+done
+
+# Import admin setelah migration.
+# Kompatibilitas dengan model Admin pada image Marzban saat ini:
+# telegram_id harus integer dan discord_webhook berupa string.
+# Patch dilakukan DI DALAM container sebelum CLI dijalankan.
+if command -v marzban >/dev/null 2>&1; then
+    colorized_echo cyan "Menyiapkan kompatibilitas CLI admin Marzban..."
+
+    $COMPOSE_CMD exec -T marzban python - <<'PY'
+from pathlib import Path
+
+p = Path("/code/cli/admin.py")
+s = p.read_text(encoding="utf-8")
+original = s
+
+# Existing-admin path
+s = s.replace(
+    'AdminPartialModify(password=password, is_sudo=True)',
+    'AdminPartialModify(password=password, is_sudo=True, telegram_id=0, discord_webhook="")'
+)
+s = s.replace(
+    'AdminPartialModify(password=password, is_sudo=True, telegram_id="", discord_webhook="")',
+    'AdminPartialModify(password=password, is_sudo=True, telegram_id=0, discord_webhook="")'
+)
+
+# New-admin path
+s = s.replace(
+    'AdminCreate(username=username, password=password, is_sudo=True)',
+    'AdminCreate(username=username, password=password, is_sudo=True, telegram_id=0, discord_webhook="")'
+)
+s = s.replace(
+    'AdminCreate(username=username, password=password, is_sudo=True, telegram_id="", discord_webhook="")',
+    'AdminCreate(username=username, password=password, is_sudo=True, telegram_id=0, discord_webhook="")'
+)
+
+if s != original:
+    p.write_text(s, encoding="utf-8")
+    print("ADMIN_CLI_PATCHED")
+else:
+    print("ADMIN_CLI_ALREADY_COMPATIBLE_OR_PATTERN_CHANGED")
+PY
+
+    if ! marzban cli admin import-from-env -y; then
+        colorized_echo red "Import admin gagal."
+        $COMPOSE_CMD logs --tail=80 marzban || true
+        return 1
+    fi
+
+    # Remove bootstrap credentials after successful import.
+    if [ -f /opt/marzban/.env ]; then
+        sed -i             '/^[[:space:]]*SUDO_USERNAME[[:space:]]*=/d;
+             /^[[:space:]]*SUDO_PASSWORD[[:space:]]*=/d'             /opt/marzban/.env
+    fi
+fi
+
+# Hapus kredensial sementara dari .env setelah admin berhasil dibuat.
+sed -i "s/SUDO_USERNAME = \"${userpanel}\"/# SUDO_USERNAME = \"admin\"/" /opt/marzban/.env
+sed -i "s/SUDO_PASSWORD = \"${passpanel}\"/# SUDO_PASSWORD = \"admin\"/" /opt/marzban/.env
+
+$COMPOSE_CMD up -d --remove-orphans
+cd
+echo "Marzban siap; melanjutkan ke pembuatan token API."
+
+}
+
+
+
+# =========================================================
+# XRAY CLOUDFRONT - TAMBAHAN SAJA
+# Tidak mengubah SSH/Dropbear/ZiVPN.
+# Host: cf.<domain>
+# WS: /vmess-cloudfront /vless-cloudfront /trojan-cloudfront
+# =========================================================
+setup_xray_cloudfront() {
+    set -e
+    local CF_DOMAIN="cf.${domain}"
+    local CF_DIR="/var/lib/marzban/cloudfront"
+    local CF_CONFIG="${CF_DIR}/config.json"
+    local CF_SYNC="/usr/local/bin/sync-marzban-cloudfront.py"
+    local CF_SERVICE="/etc/systemd/system/xray-cloudfront.service"
+    local CF_SYNC_SERVICE="/etc/systemd/system/marzban-cloudfront-sync.service"
+    local CF_TIMER="/etc/systemd/system/marzban-cloudfront-sync.timer"
+    local CF_NGINX="/opt/marzban/cloudfront-nginx.conf"
+    local XRAY_BIN="/var/lib/marzban/core/xray"
+
+    [ -x "$XRAY_BIN" ] || { colorized_echo red "❌ Xray-core tidak ditemukan: $XRAY_BIN"; return 1; }
+    [ -f /opt/marzban/docker-compose.yml ] || { colorized_echo red "❌ docker-compose.yml Marzban tidak ditemukan."; return 1; }
+
+    mkdir -p "$CF_DIR" /var/log/xray
+
+    cat > "$CF_SYNC" <<'PY'
+#!/usr/bin/env python3
+import json, os, sqlite3, tempfile, time
+DB="/var/lib/marzban/db.sqlite3"
+OUT="/var/lib/marzban/cloudfront/config.json"
+def active(expire,status):
+    status=(status or "").lower()
+    if status and status!="active": return False
+    if expire not in (None,0) and int(expire)<=int(time.time()): return False
+    return True
+if not os.path.isfile(DB): raise SystemExit("Database Marzban tidak ditemukan: "+DB)
+con=sqlite3.connect(DB); con.row_factory=sqlite3.Row
+try:
+    rows=con.execute("SELECT username, proxies, status, expire FROM users").fetchall()
+finally: con.close()
+vmess=[]; vless=[]; trojan=[]; sv=set(); sl=set(); st=set()
+for r in rows:
+    if not active(r["expire"],r["status"]): continue
+    try: proxies=json.loads(r["proxies"] or "{}")
+    except Exception: continue
+    p=proxies.get("vmess") or {}; uid=p.get("id")
+    if uid and uid not in sv: vmess.append({"id":uid,"email":r["username"] or ""}); sv.add(uid)
+    p=proxies.get("vless") or {}; uid=p.get("id")
+    if uid and uid not in sl: vless.append({"id":uid,"email":r["username"] or ""}); sl.add(uid)
+    p=proxies.get("trojan") or {}; pwd=p.get("password")
+    if pwd and pwd not in st: trojan.append({"password":pwd,"email":r["username"] or ""}); st.add(pwd)
+cfg={"log":{"access":"/var/log/xray/cloudfront-access.log","error":"/var/log/xray/cloudfront-error.log","loglevel":"warning"},
+     "inbounds":[
+       {"listen":"127.0.0.1","port":10010,"protocol":"vmess","settings":{"clients":vmess},
+        "streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/vmess-cloudfront"}}},
+       {"listen":"127.0.0.1","port":10011,"protocol":"vless","settings":{"clients":vless,"decryption":"none"},
+        "streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/vless-cloudfront"}}},
+       {"listen":"127.0.0.1","port":10012,"protocol":"trojan","settings":{"clients":trojan},
+        "streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/trojan-cloudfront"}}}],
+     "outbounds":[{"protocol":"freedom","tag":"direct"}]}
+os.makedirs(os.path.dirname(OUT),exist_ok=True)
+fd,tmp=tempfile.mkstemp(prefix=".cloudfront-",suffix=".json",dir=os.path.dirname(OUT))
+with os.fdopen(fd,"w") as f: json.dump(cfg,f,indent=2); f.write("\n")
+os.replace(tmp,OUT)
+print("CloudFront sync: VMess=%d VLESS=%d Trojan=%d"%(len(vmess),len(vless),len(trojan)))
+PY
+    chmod 755 "$CF_SYNC"
+    python3 "$CF_SYNC"
+
+    "$XRAY_BIN" run -test -config "$CF_CONFIG" >/tmp/xray-cloudfront-test.log 2>&1 || {
+        cat /tmp/xray-cloudfront-test.log
+        return 1
+    }
+
+    cat > "$CF_SERVICE" <<EOF
+[Unit]
+Description=Xray CloudFront WS (Marzban users)
+After=network-online.target docker.service
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStart=${XRAY_BIN} run -config ${CF_CONFIG}
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
-
 [Install]
 WantedBy=multi-user.target
 EOF
 
     cat > "$CF_SYNC_SERVICE" <<EOF
 [Unit]
-Description=Sync Marzban users to CloudFront Xray
-
+Description=Sync Marzban users to Xray CloudFront
+After=docker.service
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 ${CF_SYNC}
-ExecStartPost=/bin/systemctl try-restart xray-cloudflare.service
+ExecStartPost=/bin/systemctl try-restart xray-cloudfront.service
 EOF
 
     cat > "$CF_TIMER" <<EOF
 [Unit]
 Description=Periodic Marzban CloudFront user sync
-
 [Timer]
-OnBootSec=20s
+OnBootSec=30s
 OnUnitActiveSec=30s
 Unit=marzban-cloudfront-sync.service
 Persistent=true
-
 [Install]
 WantedBy=timers.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable --now xray-cloudflare
-    systemctl enable --now marzban-cloudfront-sync.timer
-    systemctl start marzban-cloudfront-sync.service
-
-    if ! systemctl is-active --quiet xray-cloudflare; then
-        echo -e "${RED}❌ xray-cloudflare.service gagal berjalan.${NC}"
-        journalctl -u xray-cloudflare -n 80 --no-pager || true
-        exit 1
-    fi
-
-    for cf_port in "$CF_VMESS_PORT" "$CF_VLESS_PORT" "$CF_TROJAN_PORT"; do
-        if ! ss -lnt 2>/dev/null | grep -Eq ":${cf_port}\\b"; then
-            echo -e "${RED}❌ Port CloudFront ${cf_port} tidak LISTEN.${NC}"
-            journalctl -u xray-cloudflare -n 80 --no-pager || true
-            exit 1
-        fi
-    done
-
-    echo -e "${GREEN}✓ CloudFront WS aktif: VMess + VLESS + Trojan.${NC}"
-    echo "  Domain : ${CF_DOMAIN}:443"
-    echo "  VMess  : /vmess-cloudfront"
-    echo "  VLESS  : /vless-cloudfront"
-    echo "  Trojan : /trojan-cloudfront"
-    echo "  UUID/password: dari user Marzban"
-    echo "  Sync: setiap 30 detik"
-}
-
-
-PRECHECK_NGINX_PORTS() {
-    echo "Checking ports 80/443 before host Nginx..."
-    if ss -lnt 2>/dev/null | grep -Eq '0\.0\.0\.0:80|:::80|0\.0\.0\.0:443|:::443'; then
-        echo "WARNING: ports 80/443 are already in use."
-        ss -lntp 2>/dev/null | grep -E ':(80|443)\b' || true
-    fi
-}
-
-PRECHECK_NGINX_PORTS
-setup_host_nginx_cloudflare() {
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}Menyiapkan Nginx + SSL + Cloudflare...${NC}"
-
-    apt-get update -y >/dev/null 2>&1
-    apt-get install -y nginx openssl >/dev/null 2>&1
-
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-    mkdir -p /etc/letsencrypt/live/"$domain"
-
-    # Stop the distro Nginx only while ACME standalone binds to port 80.
-    systemctl stop nginx >/dev/null 2>&1 || true
-
-    if [[ ! -s "/etc/letsencrypt/live/${domain}/fullchain.pem" ||
-          ! -s "/etc/letsencrypt/live/${domain}/privkey.pem" ]]; then
-        if [[ ! -x /root/.acme.sh/acme.sh ]]; then
-            curl -fsSL https://get.acme.sh | sh -s email="$email"
-        fi
-
-        /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-        # One LE certificate covers both the main Marzban hostname and cf.<domain>.
-        # Keep cf.<domain> pointing to this VPS during issuance; after install,
-        # switch only cf.<domain> to Cloudflare Proxy (orange cloud).
-        /root/.acme.sh/acme.sh --issue -d "$domain" -d "$CF_DOMAIN" --standalone -k ec-256 --force
-        /root/.acme.sh/acme.sh --install-cert -d "$domain" --ecc \
-            --fullchain-file "/etc/letsencrypt/live/${domain}/fullchain.pem" \
-            --key-file "/etc/letsencrypt/live/${domain}/privkey.pem"
-    fi
-
-    if [[ ! -s "/etc/letsencrypt/live/${domain}/fullchain.pem" ||
-          ! -s "/etc/letsencrypt/live/${domain}/privkey.pem" ]]; then
-        echo -e "${RED}❌ SSL certificate tidak tersedia.${NC}"
-        exit 1
-    fi
-
-    # Do NOT replace Marzban's generated Xray config.
-    # Main hostname remains normal/DNS-only; CloudFront gets a dedicated hostname.
-    cat > /etc/nginx/sites-available/marzban-cloudflare <<EOF
-# Main Marzban hostname: DNS ONLY (gray cloud)
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${domain};
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name ${domain};
-
-    ssl_certificate     /etc/letsencrypt/live/${domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-
-    # Normal Marzban dashboard/API/subscription only.
-    location / {
-        proxy_pass http://127.0.0.1:${port};
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_read_timeout 86400;
-        proxy_send_timeout 86400;
-        proxy_buffering off;
-    }
-}
-
-# Dedicated CloudFront hostname: cf.${domain} (orange cloud)
+    cat > "$CF_NGINX" <<EOF
 server {
     listen 80;
     listen [::]:80;
     server_name ${CF_DOMAIN};
-    location / { return 301 https://\$host\$request_uri; }
+    location / {
+        return 301 https://\\$host\\$request_uri;
+    }
 }
-
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen 443 ssl;
+    listen [::]:443 ssl;
     server_name ${CF_DOMAIN};
-
-    ssl_certificate     /etc/letsencrypt/live/${domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+    ssl_certificate /var/lib/marzban/xray.crt;
+    ssl_certificate_key /var/lib/marzban/xray.key;
     ssl_protocols TLSv1.2 TLSv1.3;
-
-    # CloudFront WS -> isolated Xray VMess
     location = /vmess-cloudfront {
-        proxy_pass http://127.0.0.1:${CF_VMESS_PORT};
+        proxy_pass http://127.0.0.1:10010;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Upgrade \\$http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
+        proxy_set_header Host \\$host;
         proxy_read_timeout 86400;
         proxy_send_timeout 86400;
         proxy_buffering off;
     }
-
-    # CloudFront WS -> isolated Xray VLESS
     location = /vless-cloudfront {
-        proxy_pass http://127.0.0.1:${CF_VLESS_PORT};
+        proxy_pass http://127.0.0.1:10011;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Upgrade \\$http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
+        proxy_set_header Host \\$host;
         proxy_read_timeout 86400;
         proxy_send_timeout 86400;
         proxy_buffering off;
     }
-
-    # CloudFront WS -> isolated Xray Trojan
     location = /trojan-cloudfront {
-        proxy_pass http://127.0.0.1:${CF_TROJAN_PORT};
+        proxy_pass http://127.0.0.1:10012;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Upgrade \\$http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
+        proxy_set_header Host \\$host;
         proxy_read_timeout 86400;
         proxy_send_timeout 86400;
         proxy_buffering off;
     }
-
     location / { return 404; }
 }
 EOF
 
-    rm -f /etc/nginx/sites-enabled/default
-    ln -sfn /etc/nginx/sites-available/marzban-cloudflare /etc/nginx/sites-enabled/marzban-cloudflare
+    apt-get install -y yq >/dev/null 2>&1 || { colorized_echo red "❌ Gagal memasang yq."; return 1; }
 
-    nginx -t
-    systemctl enable nginx >/dev/null 2>&1
-    systemctl restart nginx
-    sleep 2
+    if ! docker compose -f /opt/marzban/docker-compose.yml config --services 2>/dev/null | grep -qx nginx; then
+        colorized_echo red "❌ Service nginx tidak ditemukan di compose Marzban."
+        return 1
+    fi
 
-    if ! systemctl is-active --quiet nginx; then
-        echo -e "${RED}❌ Nginx gagal berjalan.${NC}"
-        systemctl status nginx --no-pager -l || true
-        exit 1
+    # Mount the existing nginx config and CloudFront include into the EXISTING nginx service.
+    yq -i '
+      (.services.nginx.volumes //= []) |
+      (.services.nginx.volumes |= unique) |
+      (.services.nginx.volumes += [
+        "/opt/marzban/nginx.conf:/etc/nginx/nginx.conf:ro",
+        "/opt/marzban/cloudfront-nginx.conf:/etc/nginx/cloudfront-nginx.conf:ro",
+        "/var/lib/marzban:/var/lib/marzban:ro"
+      ] | unique)
+    ' /opt/marzban/docker-compose.yml
+
+    if ! grep -Fq 'include /etc/nginx/cloudfront-nginx.conf;' /opt/marzban/nginx.conf; then
+        python3 - <<'PY'
+from pathlib import Path
+p=Path("/opt/marzban/nginx.conf")
+s=p.read_text()
+needle="include /etc/nginx/cloudfront-nginx.conf;"
+lines=s.splitlines(True)
+depth=0
+in_http=False
+inserted=False
+out=[]
+for line in lines:
+    stripped=line.strip()
+    if stripped.startswith("http") and stripped.endswith("{") and not in_http:
+        in_http=True
+    if in_http and stripped=="}" and depth==1 and not inserted:
+        out.append("    "+needle+"\n"); inserted=True
+    out.append(line)
+    depth += line.count("{")-line.count("}")
+    if in_http and depth<=0: in_http=False
+if not inserted: raise SystemExit("Blok http{} tidak ditemukan pada nginx.conf")
+p.write_text("".join(out))
+PY
+    fi
+
+    # The downloaded certificate directory is already part of Marzban data;
+    # ensure nginx container has access to it through the mount above.
+
+    systemctl daemon-reload
+    systemctl enable --now xray-cloudfront.service
+    systemctl enable --now marzban-cloudfront-sync.timer
+
+    docker compose -f /opt/marzban/docker-compose.yml up -d --force-recreate nginx
+    docker compose -f /opt/marzban/docker-compose.yml exec -T nginx nginx -t
+
+    systemctl is-active --quiet xray-cloudfront.service || {
+        journalctl -u xray-cloudfront.service -n 80 --no-pager || true
+        return 1
+    }
+
+    for p in 10010 10011 10012; do
+        ss -lnt 2>/dev/null | grep -Eq ":${p}\\b" || {
+            echo "CloudFront port ${p} tidak LISTEN."
+            journalctl -u xray-cloudfront.service -n 80 --no-pager || true
+            return 1
+        }
+    done
+
+    echo -e "${GREEN}✓ Xray CloudFront: VMess + VLESS + Trojan.${NC}"
+    echo "  Host   : ${CF_DOMAIN}:443"
+    echo "  Paths  : /vmess-cloudfront /vless-cloudfront /trojan-cloudfront"
+}
+
+stage10() {
+    set -e
+
+    # =========================================================
+    # TOKEN API MARZBAN - FINAL ROBUST
+    # Jangan langsung request setelah container start.
+    # Marzban/uvicorn butuh waktu untuk bind port dan siap menerima API.
+    # =========================================================
+    mkdir -p /etc/data
+    chmod 700 /etc/data
+
+    TOKEN_FILE="/etc/data/token.json"
+    TOKEN_TMP="/etc/data/.token.json.tmp"
+    rm -f "$TOKEN_TMP"
+
+    # Ambil port yang benar-benar digunakan Marzban dari .env.
+    # Jika tidak ditemukan, gunakan port dari konfigurasi installer.
+    API_PORT=""
+    if [ -f /opt/marzban/.env ]; then
+        API_PORT="$(sed -n 's/^[[:space:]]*UVICORN_PORT[[:space:]]*=[[:space:]]*//p' /opt/marzban/.env | tail -n 1 | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
+    fi
+    [ -n "$API_PORT" ] || API_PORT="${port}"
+    [ -n "$API_PORT" ] || API_PORT="8000"
+
+    token_ok() {
+        [ -s "$TOKEN_TMP" ] || return 1
+        if command -v jq >/dev/null 2>&1; then
+            jq -e '(.access_token // "") | length > 0' "$TOKEN_TMP" >/dev/null 2>&1
+        else
+            grep -q '"access_token"[[:space:]]*:' "$TOKEN_TMP"
+        fi
+    }
+
+    request_token() {
+        local url="$1"
+        : > "$TOKEN_TMP"
+        curl -4ksS --connect-timeout 5 --max-time 15 \
+            -X POST "$url" \
+            -H 'accept: application/json' \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode 'grant_type=password' \
+            --data-urlencode "username=${userpanel}" \
+            --data-urlencode "password=${passpanel}" \
+            --data-urlencode 'scope=' \
+            --data-urlencode 'client_id=' \
+            --data-urlencode 'client_secret=' \
+            > "$TOKEN_TMP" 2>/dev/null
+    }
+
+    colorized_echo cyan "Menunggu Marzban benar-benar siap..."
+
+    # Tunggu sampai port API benar-benar listen.
+    READY=0
+    for i in $(seq 1 45); do
+        if (command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":${API_PORT}$|\]:${API_PORT}$") \
+           || (command -v netstat >/dev/null 2>&1 && netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":${API_PORT}$|\]:${API_PORT}$"); then
+            READY=1
+            break
+        fi
+
+        # Pastikan container tetap hidup sambil menunggu.
+        if ! docker inspect -f '{{.State.Running}}' marzban-marzban-1 2>/dev/null | grep -q true; then
+            $COMPOSE_CMD -f /opt/marzban/docker-compose.yml up -d marzban >/dev/null 2>&1 || true
+        fi
+        sleep 2
+    done
+
+    if [ "$READY" -eq 0 ]; then
+        colorized_echo yellow "Port ${API_PORT} belum terdeteksi setelah 90 detik; tetap mencoba API lokal."
+    else
+        colorized_echo green "Marzban API sudah listen di port ${API_PORT}."
+    fi
+
+    colorized_echo cyan "Membuat token API Marzban..."
+    TOKEN_SUCCESS=0
+
+    # Coba lokal berulang kali. Ini mengatasi race-condition saat container baru start.
+    for i in $(seq 1 15); do
+        if request_token "https://127.0.0.1:${API_PORT}/api/admin/token" && token_ok; then
+            TOKEN_SUCCESS=1
+            break
+        fi
+
+        if request_token "http://127.0.0.1:${API_PORT}/api/admin/token" && token_ok; then
+            TOKEN_SUCCESS=1
+            break
+        fi
+
+        sleep 2
+    done
+
+    # Domain hanya fallback terakhir.
+    if [ "$TOKEN_SUCCESS" -eq 0 ]; then
+        for i in $(seq 1 5); do
+            if request_token "https://${domain}:${API_PORT}/api/admin/token" && token_ok; then
+                TOKEN_SUCCESS=1
+                break
+            fi
+            sleep 2
+        done
+    fi
+
+    if [ "$TOKEN_SUCCESS" -eq 0 ]; then
+        colorized_echo red "Gagal membuat token API Marzban."
+        echo "Port API yang digunakan: ${API_PORT}"
+        echo "Periksa status Marzban dan listener port:"
+        ss -ltnp 2>/dev/null | grep -E ":${API_PORT}[[:space:]]|:${API_PORT}$" || true
+        echo
+        $COMPOSE_CMD -f /opt/marzban/docker-compose.yml ps 2>/dev/null || true
+        echo
+        echo "Log Marzban terakhir:"
+        $COMPOSE_CMD -f /opt/marzban/docker-compose.yml logs --tail=40 marzban 2>/dev/null || true
+        echo
+        echo "Respons terakhir:"
+        cat "$TOKEN_TMP" 2>/dev/null || true
+        rm -f "$TOKEN_TMP"
+        return 1
+    fi
+
+    mv -f "$TOKEN_TMP" "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+    colorized_echo green "Token API Marzban berhasil dibuat."
+
+    cd
+    sed -i -e 's/\r$//' /usr/bin/routing
+    if command -v neofetch >/dev/null 2>&1; then
+        neofetch
+    elif command -v fastfetch >/dev/null 2>&1; then
+        fastfetch
+    fi
+    if [ -f ~/.config/neofetch/config.conf ]; then
+        sed -i '/info title/d' ~/.config/neofetch/config.conf
+        sed -i '/info "Packages" packages/d' ~/.config/neofetch/config.conf
+        sed -i '/info "Shell" shell/d' ~/.config/neofetch/config.conf
+        sed -i '/info "Resolution" resolution/d' ~/.config/neofetch/config.conf
+        sed -i '/info "Memory" memory/d' ~/.config/neofetch/config.conf
+    fi
+    command -v profile >/dev/null 2>&1 && profile || true
+    echo "Untuk data login dashboard Marzban: " | tee -a /root/log-install.txt
+    echo "-=================================-" | tee -a /root/log-install.txt
+    echo "URL       : https://${domain}:${port}/dashboard" | tee -a /root/log-install.txt
+    echo "username  : ${userpanel}" | tee -a /root/log-install.txt
+    echo "password  : ${passpanel}" | tee -a /root/log-install.txt
+    echo "-=================================-" | tee -a /root/log-install.txt
+    echo "Script telah berhasil di install" | tee -a /root/log-install.txt
+    marzban cli admin delete -u admin -y || log "WARN: cleanup admin dilewati (exit=$?)"
+}
+
+# =========================================================
+# REBUILD VPS
+# Dipasang sebagai /usr/local/bin/rebuild
+# =========================================================
+install_rebuild() {
+    local target="/usr/local/bin/rebuild"
+    local tmp="${target}.tmp"
+    local url="${sfile}/rebuild"
+
+    colorized_echo cyan "[*] Memasang Rebuild VPS..."
+
+    if ! command -v curl >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1 || true
+        apt-get install -y curl >/dev/null 2>&1 || {
+            colorized_echo yellow "[!] curl tidak tersedia. Rebuild dilewati."
+            return 0
+        }
+    fi
+
+    if curl -4fsSL --retry 3 --connect-timeout 15 --max-time 120 \
+        "$url" -o "$tmp"; then
+        if [ -s "$tmp" ] && bash -n "$tmp" >/dev/null 2>&1; then
+            chmod 755 "$tmp"
+            mv -f "$tmp" "$target"
+            colorized_echo green "[✓] Rebuild VPS terpasang: $target"
+        else
+            rm -f "$tmp"
+            colorized_echo yellow "[!] File Rebuild tidak valid. Instalasi dilanjutkan."
+        fi
+    else
+        rm -f "$tmp"
+        colorized_echo yellow "[!] Gagal mengambil Rebuild. Instalasi dilanjutkan."
     fi
 }
 
+install_rebuild
 
+run_stage 01 "Validasi OS + input konfigurasi" stage01
+run_stage 02 "Persiapan VPS + paket" stage02
+run_stage 03 "Bootstrap Marzban + Xray" stage03
+run_stage 04 "Profile + VNStat + Speedtest + Gotop" stage04
+run_stage 05 "Nginx + SSL + konfigurasi Xray" stage05
+run_stage 06 "Command LingVPN + Ganti Domain + BWBOT + cron" stage06
+run_stage 07 "Firewall + Fail2ban" stage07
+run_stage 08 "Database + WARP" stage08
+run_stage 09 "Migration database + Admin Marzban" stage09
+setup_xray_cloudfront
+run_stage 10 "Token API + finalisasi" stage10
 
+# =========================================================
+# TELEGRAM FINAL SETUP - PALING AKHIR
+# Token + Chat ID baru diminta setelah seluruh stage 01-10 selesai.
+# Config yang sama dipakai BWBOT + menu-backup + BOT Usage.
+# =========================================================
+telegram_final_setup() {
+    mkdir -p /etc/data
+    chmod 700 /etc/data
 
-#profile
-echo -e 'profile' >> /root/.profile
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/profile" /usr/local/bin/profile
-chmod +x /usr/local/bin/profile
+    local config_file="/etc/data/telegram_config.conf"
+    local tg_bot tg_chat
 
-#install compose
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/docker-compose.yml" /opt/marzban/docker-compose.yml
+    echo
+    colorized_echo cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    colorized_echo cyan "        KONFIGURASI TELEGRAM - TAHAP AKHIR"
+    colorized_echo cyan "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Semua instalasi VPS sudah selesai."
+    echo "Sekarang masukkan Bot Token dan Chat ID Telegram."
+    echo
 
-# Force the Marzban container to track the official latest stable image.
-# This prevents a custom compose file from silently pinning an older version.
-if command -v yq >/dev/null 2>&1; then
-    yq -i '.services.marzban.image = "gozargah/marzban:latest"' /opt/marzban/docker-compose.yml
-else
-    sed -i -E 's#(^[[:space:]]*image:[[:space:]]*gozargah/marzban:).*#\1latest#' /opt/marzban/docker-compose.yml
-fi
+    while true; do
+        read -r -p "Masukkan Telegram Bot Token: " tg_bot
+        tg_bot="${tg_bot#botToken=}"
+        tg_bot="${tg_bot#BOT_TOKEN=}"
+        tg_bot="${tg_bot#TELEGRAM_BOT_TOKEN=}"
+        tg_bot="${tg_bot//$'\r'/}"
+        tg_bot="${tg_bot//$'\n'/}"
 
-# Make sure the custom compose file mounts the Marzban data directory.
-# Without this mount, the host-installed Xray core cannot be reached by the container.
-if command -v yq >/dev/null 2>&1; then
-    yq -i '(.services.marzban.volumes //= []) | (.services.marzban.volumes |= unique) | (.services.marzban.volumes += ["/var/lib/marzban:/var/lib/marzban"] | unique)' /opt/marzban/docker-compose.yml
-fi
+        if [[ "$tg_bot" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+            break
+        fi
+        colorized_echo red "[ERROR] Bot Token tidak valid."
+    done
 
-#Install VNSTAT
-apt -y install vnstat
-/etc/init.d/vnstat restart
-apt -y install libsqlite3-dev
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/vnstat-2.6.tar.gz" /root/vnstat-2.6.tar.gz
-tar zxvf /root/vnstat-2.6.tar.gz
-cd vnstat-2.6
-./configure --prefix=/usr --sysconfdir=/etc && make && make install 
-cd
-chown vnstat:vnstat /var/lib/vnstat -R
-systemctl enable vnstat
-/etc/init.d/vnstat restart
-rm -f /root/vnstat-2.6.tar.gz 
-rm -rf /root/vnstat-2.6
+    while true; do
+        read -r -p "Masukkan Telegram Chat ID: " tg_chat
+        tg_chat="${tg_chat#chatId=}"
+        tg_chat="${tg_chat#CHAT_ID=}"
+        tg_chat="${tg_chat#TELEGRAM_CHAT_ID=}"
+        tg_chat="${tg_chat//$'\r'/}"
+        tg_chat="${tg_chat//$'\n'/}"
 
-#Install Speedtest
-curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | sudo bash
-sudo apt-get install speedtest -y
+        if [[ "$tg_chat" =~ ^-?[0-9]+$ ]]; then
+            break
+        fi
+        colorized_echo red "[ERROR] Chat ID harus berupa angka."
+    done
 
-# Nginx is configured later by setup_host_nginx_cloudflare().
-# Do not download the old custom Nginx/Marzban compose templates here:
-# they can conflict with the official Marzban layout and are not needed
-# for the dedicated Cloudflare path.
-mkdir -p /var/log/nginx
-touch /var/log/nginx/access.log /var/log/nginx/error.log
-mkdir -p /var/www/html
+    # Shell-safe config. Semua nama variabel kompatibel dengan script lama/baru.
+    umask 077
+    {
+        printf 'BOT_TOKEN=%q\n' "$tg_bot"
+        printf 'CHAT_ID=%q\n' "$tg_chat"
+        printf 'botToken=%q\n' "$tg_bot"
+        printf 'chatId=%q\n' "$tg_chat"
+        printf 'TELEGRAM_BOT_TOKEN=%q\n' "$tg_bot"
+        printf 'TELEGRAM_CHAT_ID=%q\n' "$tg_chat"
+        printf 'REMARKS=%q\n' ""
+        printf 'button_text=%q\n' "Cek Server"
+        printf 'button_url=%q\n' "https://google.com"
+    } > "$config_file"
+    chmod 600 "$config_file"
 
-#install socat
-apt install iptables -y
-apt install curl socat xz-utils wget apt-transport-https gnupg gnupg2 gnupg1 dnsutils lsb-release jq -y 
-apt install socat cron bash-completion -y
+    echo
+    colorized_echo green "[✓] Konfigurasi Telegram tersimpan."
 
-#install cert
-# Marzban generates/maintains /var/lib/marzban/xray_config.json.
-# The Cloudflare inbound is isolated in /var/lib/marzban/cloudfront/config.json.
+    # Validasi token langsung ke Telegram tanpa menampilkan token.
+    local api_result
+    api_result="$(curl -4fsS --connect-timeout 10 --max-time 20 \
+        "https://api.telegram.org/bot${tg_bot}/getMe" 2>/dev/null || true)"
 
-#install firewall
-apt install ufw -y
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
-sudo ufw allow ssh
-sudo ufw allow http
-sudo ufw allow https
-sudo ufw allow 8081/tcp
-sudo ufw allow $port/tcp
-yes | sudo ufw enable
+    if printf '%s' "$api_result" | grep -q '"ok":true'; then
+        colorized_echo green "[✓] Bot Token Telegram valid."
+    else
+        colorized_echo yellow "[!] Token tersimpan, tetapi validasi Telegram gagal."
+        echo "    Periksa token atau koneksi internet bila bot belum merespons."
+    fi
 
-# Marzban database
-# Do NOT download/restore a bundled db.sqlite3 from GitHub.
-# Marzban creates and migrates its runtime database during installation.
-mkdir -p /var/lib/marzban
+    echo
+    colorized_echo green "[✓] Telegram BWBOT + menu-backup + BOT Usage tersinkron."
+}
 
-# WARP Proxy tidak dipasang otomatis. Installer ini fokus pada Xray/Marzban.
-# Jika WARP diperlukan, pasang secara terpisah melalui menu yang memang digunakan.
+telegram_final_setup
+install_bot_usage
 
-#finishing
-apt autoremove -y
-apt clean
-cd /opt/marzban
-sed -i "s/# SUDO_USERNAME = \"admin\"/SUDO_USERNAME = \"${userpanel}\"/" /opt/marzban/.env
-sed -i "s/# SUDO_PASSWORD = \"admin\"/SUDO_PASSWORD = \"${passpanel}\"/" /opt/marzban/.env
-sed -i "s/UVICORN_PORT = 7879/UVICORN_PORT = ${port}/" /opt/marzban/.env
-sed -i "s/__MARZBAN_PORT__/${port}/g; s/__MARZBAN_DOMAIN__/${domain}/g" /opt/marzban/xray.conf
-docker compose down || true
-# Pull the latest Marzban image explicitly so an old local image is never reused.
-docker compose pull marzban
+colorized_echo green "╔════════════════════════════════════════════════════╗"
+colorized_echo green "║       LINGVPN MARZBAN INSTALLATION SELESAI       ║"
+colorized_echo green "╚════════════════════════════════════════════════════╝"
+log "INSTALLATION COMPLETE"
+echo
+read -rp "Reboot sekarang? [y/N]: " answer
+if [[ "$answer" =~ ^[Yy]$ ]]; then reboot; fi
 
-# Host Nginx owns ports 80/443. If the compose file contains an Nginx
-# service using host networking, disable that service before starting Marzban.
-if docker compose config --services 2>/dev/null | grep -qx 'nginx'; then
-    echo "Disabling compose nginx: host nginx will own ports 80/443"
-    docker compose stop nginx >/dev/null 2>&1 || true
-fi
-docker compose up -d marzban
-sleep 8
-if ! docker compose ps >/dev/null 2>&1; then
-    echo -e "${RED}❌ Docker Compose Marzban gagal dijalankan.${NC}"
-    docker compose ps || true
-    exit 1
-fi
-marzban cli admin import-from-env -y
-sed -i "s/SUDO_USERNAME = \"${userpanel}\"/# SUDO_USERNAME = \"admin\"/" /opt/marzban/.env
-sed -i "s/SUDO_PASSWORD = \"${passpanel}\"/# SUDO_PASSWORD = \"admin\"/" /opt/marzban/.env
-docker compose down || true
-docker compose up -d
-sleep 5
+# =========================================================
+# FAIQVPN CHECK_USAGE BOT
+# Telegram token/chat ID memakai /etc/data/telegram_config.conf.
+# Tidak memasang telegram-vps-menu.py / remote menu.
+# =========================================================
 
-# Marzban DB now exists. Configure host Nginx/SSL first, then start
-# the independent CloudFront Xray endpoint. Nothing here installs, stops,
-# or reconfigures SSH/Dropbear/ZiVPN services.
-setup_host_nginx_cloudflare
-setup_xray_cloudflare
+# Aktifkan BOT Check Usage sebelum installer menawarkan reboot.
 
-cd
-# Verify that the running container uses the latest Marzban image and the requested Xray core.
-MARZBAN_IMAGE="$(docker inspect -f '{{.Config.Image}}' "$(docker compose -f /opt/marzban/docker-compose.yml ps -q marzban)" 2>/dev/null || true)"
-if [[ "$MARZBAN_IMAGE" != "gozargah/marzban:latest" ]]; then
-    echo -e "${RED}❌ Marzban image bukan latest: ${MARZBAN_IMAGE:-unknown}${NC}"
-    exit 1
-fi
-if ! grep -q '^XRAY_EXECUTABLE_PATH = "/var/lib/marzban/core/xray"' /opt/marzban/.env; then
-    echo -e "${RED}❌ XRAY_EXECUTABLE_PATH belum mengarah ke core terbaru.${NC}"
-    exit 1
-fi
+colorized_echo green "╔════════════════════════════════════════════════════╗"
+colorized_echo green "║       LINGVPN MARZBAN INSTALLATION SELESAI       ║"
+colorized_echo green "╚════════════════════════════════════════════════════╝"
+log "INSTALLATION COMPLETE"
+echo
+echo "Telegram Check Usage: /cek_usage atau /cek_usage username"
+echo "Service: check-usage.service"
+echo
+read -rp "Reboot sekarang? [y/N]: " answer
+if [[ "$answer" =~ ^[Yy]$ ]]; then reboot; fi
 
-# Final health check before reporting success.
-if ! docker compose -f /opt/marzban/docker-compose.yml ps >/dev/null 2>&1; then
-    echo -e "${RED}❌ Marzban belum sehat. Cek: cd /opt/marzban && docker compose ps${NC}"
-    exit 1
-fi
-echo -e " ${TEAL}╭───────────── ❏ ${WHITE}Login Panel Marzban${NC} ${TEAL}❏ ─────────────╮${NC}" | tee -a log-install.txt
-echo -e " ${TEAL}│ ❖${NC} ${WHITE}URL  :${NC} ${ORANGE}${domain}:${port}/dashboard${NC}" | tee -a log-install.txt
-echo -e " ${TEAL}│ ❖${NC} ${WHITE}User :${NC} ${ORANGE}${userpanel}${NC}" | tee -a log-install.txt
-echo -e " ${TEAL}│ ❖${NC} ${WHITE}Pass :${NC} ${ORANGE}${passpanel}${NC}" | tee -a log-install.txt
-echo -e " ${TEAL}╰───────────────────────────────────────────────────╯${NC}" | tee -a log-install.txt
-clear
+colorized_echo green "╔════════════════════════════════════════════════════╗"
+colorized_echo green "║       LINGVPN MARZBAN INSTALLATION SELESAI       ║"
+colorized_echo green "╚════════════════════════════════════════════════════╝"
+log "INSTALLATION COMPLETE"
+echo
+read -rp "Reboot sekarang? [y/N]: " answer
+if [[ "$answer" =~ ^[Yy]$ ]]; then reboot; fi
 
-# Unduh skrip pelerr
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service Token...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/faiq-token" /usr/local/bin/faiq-token
-chmod +x /usr/local/bin/faiq-token
-# Unduh skrip Routing
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service Routing...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/routing" /usr/local/bin/routing
-chmod +x /usr/local/bin/routing
-# Unduh skrip Hasil Rute
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service Hasil Routing...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/cek-route" /usr/local/bin/cek-route
-chmod +x /usr/local/bin/cek-route
-# Unduh skrip es pejuh
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service BOT Info...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/bwbot" /usr/local/bin/bwbot
-chmod +x /usr/local/bin/bwbot
-# Unduh skrip es memek
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service Speedtest...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/mod-benchmark" /usr/local/bin/mod-benchmark
-chmod +x /usr/local/bin/mod-benchmark
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/speedtest" /usr/local/bin/speedtest
-chmod +x /usr/local/bin/speedtest
-# Unduh skrip jembot bakar
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service Change Domain...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/faiq-change-domain" /usr/local/bin/faiq-change-domain
-chmod +x /usr/local/bin/faiq-change-domain
-# Unduh Service BOT Usage
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service BOT Usage...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/edydevelopeler/eDYc1Nt4j3kiFoReEveRr/main/jembot.sh" /usr/local/bin/jembot.sh
-chmod +x /usr/local/bin/jembot.sh
-# Unduh skrip memek goreng
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service Update Script...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/faiq-update" /usr/local/bin/faiq-update
-chmod +x /usr/local/bin/faiq-update
-# Unduh skrip memek bakar
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service Limit IP...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/faiq-limit-ip" /usr/local/bin/faiq-limit-ip
-chmod +x /usr/local/bin/faiq-limit-ip
-# Unduh skrip kontol goreng
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service Restore...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/restore" /usr/local/bin/restore
-chmod +x /usr/local/bin/restore
-# Download backup script
-clear
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service Backup...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/backup" /usr/local/bin/backup
-chmod +x /usr/local/bin/backup
-# Download Menu
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service Menu...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/menu" /usr/local/bin/menu
-chmod +x /usr/local/bin/menu
-# Download Repo Rebuild VPS
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service Rebuild VPS...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/faiq-rebuild" /usr/local/bin/faiq-rebuild
-chmod +x /usr/local/bin/faiq-rebuild
-# Download template
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service BOT Template...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/main.py" /usr/local/bin/main.py
-chmod +x /usr/local/bin/main.py
-# Download template
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service Usage VPN...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/usage.py" /usr/local/bin/usage.py
-chmod +x /usr/local/bin/usage.py
-# Download warpmenu
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service Warp...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/warp-hamidgh" /usr/local/bin/warp-hamidgh
-chmod +x /usr/local/bin/warp-hamidgh
-# Download apdetcore
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}Mengunduh Service Update Core...${NC}"
-sleep 1.5
-download_file "https://raw.githubusercontent.com/faiqzuhry/mummy/main/apdetcore" /usr/local/bin/apdetcore
-chmod +x /usr/local/bin/apdetcore
+# =========================================================
+# FAIQVPN CHECK_USAGE BOT
+# Telegram token/chat ID memakai /etc/data/telegram_config.conf.
+# Tidak memasang telegram-vps-menu.py / remote menu.
+# =========================================================
 
-# Tambahkan alias yang valid tanpa mengeksekusi string asing saat shell dibuka.
-for entry in "alias faiq-update='/usr/local/bin/faiq-update'" "alias menu='/usr/local/bin/menu'"; do
-    grep -Fqx "$entry" /root/.bashrc 2>/dev/null || echo "$entry" >> /root/.bashrc
-done
+# Aktifkan BOT Check Usage sebelum installer menawarkan reboot.
 
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${CYAN} ♻️ Sabar brother sedang proses pengecekan${NC}${YELLOW}...${NC}"
-sleep 2
-
-# Send success message to Telegram
-IPVPS=$(curl -fsS --max-time 10 https://ipinfo.io/ip 2>/dev/null || echo "Unknown")
-HOSTNAME=$(hostname)
-OS="${PRETTY_NAME:-unknown}"
-ISP=$(curl -fsS --max-time 10 https://ipinfo.io/org 2>/dev/null || echo "Unknown")
-REGION=$(curl -fsS --max-time 10 https://ipinfo.io/region 2>/dev/null || echo "Unknown")
-DATE=$(date '+%Y-%m-%d')
-TIME=$(date '+%H:%M:%S')
-
-MESSAGE="\`\`\`
-◇━━━━━━━━━━━━━━━━━◇
-🤖 SKT x WAN Project 🤖
-◇━━━━━━━━━━━━━━━━━◇
-❖ Status      : Active
-❖ ClientName  : $client_name
-❖ Linux OS    : $OS
-❖ Nama ISP    : $ISP
-❖ Domain      : $domain
-❖ IP VPS      : $IPVPS
-❖ Area ISP    : $REGION
-❖ Waktu       : $TIME
-❖ Tanggal     : $DATE
-❖ Exp SC      : $exp_date
-❖ Status SC   : Registrasi
-❖ Presiden    : @SaputraTech
-◇━━━━━━━━━━━━━━━━━◇
-\`\`\`"
-
-send_telegram_message "$MESSAGE"
-
-clear
-sleep 2
-echo -e "${YELLOW}╭────────────────────────────────────────────────────┐\033[0m${NC}"
-colorized_echo green "│ ➽ Alhamdulillah Beb, Script telah berhasil di install."
-echo -e "${CYAN} CloudFront Host  : ${CF_DOMAIN}"
-echo -e "${CYAN} CloudFront VMess : https://${CF_DOMAIN}/vmess-cloudfront"
-echo -e "${CYAN} CloudFront VLESS : https://${CF_DOMAIN}/vless-cloudfront"
-echo -e "${CYAN} CloudFront Trojan: https://${CF_DOMAIN}/trojan-cloudfront"
-echo -e "${CYAN} Xray-core        : ${XRAY_LATEST}"
-echo -e "${CYAN} Backend VMess    : 127.0.0.1:${CF_VMESS_PORT}"
-echo -e "${CYAN} Backend VLESS   : 127.0.0.1:${CF_VLESS_PORT}"
-echo -e "${CYAN} Backend Trojan   : 127.0.0.1:${CF_TROJAN_PORT}"
-echo -e "${YELLOW} Cloudflare DNS   : ${domain}=DNS only, ${CF_DOMAIN}=Proxied (orange cloud).${NC}"
-rm -f -- "$0" /root/inbound 2>/dev/null || true
-colorized_echo magenta "│ ➽ Sabar sayang, Sedang Menghapus admin bawaan db.sqlite"
-echo -e "${YELLOW}╰────────────────────────────────────────────────────┘\033[0m${NC}"
-marzban cli admin delete -u admin -y
-sleep 1
-echo -e "[\e[1;31mWARNING\e[0m]➽ Reboot dulu yuk sayang biar gk error, (y/n)? "
-read answer
-if [ "$answer" == "${answer#[Yy]}" ] ;then
-exit 0
-else
-cat /dev/null > ~/.bash_history && history -c && reboot
-fi
-
-
-
+colorized_echo green "╔════════════════════════════════════════════════════╗"
+colorized_echo green "║       LINGVPN MARZBAN INSTALLATION SELESAI       ║"
+colorized_echo green "╚════════════════════════════════════════════════════╝"
+log "INSTALLATION COMPLETE"
+echo
+echo "Telegram Check Usage: /cek_usage atau /cek_usage username"
+echo "Service: check-usage.service"
+echo
+read -rp "Reboot sekarang? [y/N]: " answer
+if [[ "$answer" =~ ^[Yy]$ ]]; then reboot; fi
