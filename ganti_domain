@@ -1,0 +1,522 @@
+#!/bin/bash
+# ============================================================
+# MARZBAN DOMAIN CHANGER — FINAL
+# Compatible with:
+#   - Marzban
+#   - Nginx Docker (marzban-nginx-1 / compose service nginx)
+#   - Xray CloudFront
+#   - /var/lib/marzban/cloudfront/config.json
+#   - /opt/marzban/cloudfront-nginx.conf
+#
+# SAFETY:
+#   - SSL baru harus valid sebelum mengganti sertifikat aktif.
+#   - nginx -t wajib sukses sebelum Nginx dijalankan dengan config baru.
+#   - Jika SSL/config gagal, konfigurasi lama dipulihkan.
+#   - Tidak hard-code domain lama.
+# ============================================================
+
+set -u
+umask 077
+
+MARZBAN_DIR="/opt/marzban"
+XRAY_CONF="/opt/marzban/xray.conf"
+DEFAULT_CONF="/opt/marzban/default.conf"
+NGINX_MAIN_CONF="/opt/marzban/nginx.conf"
+CF_NGINX_CONF="/opt/marzban/cloudfront-nginx.conf"
+
+CERT_FILE="/var/lib/marzban/xray.crt"
+KEY_FILE="/var/lib/marzban/xray.key"
+DOMAIN_FILE="/etc/data/domain"
+
+BACKUP_ROOT="/opt/marzban/domain-backups"
+CF_DOMAIN_PREFIX="cf."
+
+NGINX_SERVICE="nginx"
+CF_XRAY_SERVICE="xray-cloudfront.service"
+CF_SYNC_SERVICE="marzban-cloudfront-sync.service"
+
+info() { echo -e "\033[1;36m[INFO]\033[0m $1"; }
+ok()   { echo -e "\033[1;32m[ OK ]\033[0m $1"; }
+warn() { echo -e "\033[1;33m[WARN]\033[0m $1"; }
+error(){ echo -e "\033[1;31m[ERR ]\033[0m $1"; }
+die()  { error "$1"; exit 1; }
+
+rollback() {
+    warn "Melakukan rollback ke konfigurasi sebelum perubahan..."
+
+    [ -f "$BACKUP_DIR/xray.conf" ] &&
+        cp -af "$BACKUP_DIR/xray.conf" "$XRAY_CONF"
+    [ -f "$BACKUP_DIR/default.conf" ] &&
+        cp -af "$BACKUP_DIR/default.conf" "$DEFAULT_CONF"
+    [ -f "$BACKUP_DIR/cloudfront-nginx.conf" ] &&
+        cp -af "$BACKUP_DIR/cloudfront-nginx.conf" "$CF_NGINX_CONF"
+
+    if [ -f "$BACKUP_DIR/xray.crt" ] && [ -f "$BACKUP_DIR/xray.key" ]; then
+        cp -af "$BACKUP_DIR/xray.crt" "$CERT_FILE"
+        cp -af "$BACKUP_DIR/xray.key" "$KEY_FILE"
+    fi
+
+    if [ -n "${CURRENT_DOMAIN:-}" ]; then
+        printf '%s\n' "$CURRENT_DOMAIN" > "$DOMAIN_FILE"
+    fi
+
+    chmod 600 "$CERT_FILE" "$KEY_FILE" 2>/dev/null || true
+
+    docker compose -f "$MARZBAN_DIR/docker-compose.yml" up -d "$NGINX_SERVICE" >/dev/null 2>&1 || true
+    sleep 3
+
+    if docker exec marzban-nginx-1 nginx -t >/dev/null 2>&1; then
+        docker exec marzban-nginx-1 nginx -s reload >/dev/null 2>&1 || true
+    fi
+
+    systemctl try-restart "$CF_XRAY_SERVICE" >/dev/null 2>&1 || true
+}
+
+[ "$(id -u)" = "0" ] || die "Jalankan sebagai root."
+[ -d "$MARZBAN_DIR" ] || die "$MARZBAN_DIR tidak ditemukan."
+[ -f "$MARZBAN_DIR/docker-compose.yml" ] || die "docker-compose.yml tidak ditemukan."
+command -v docker >/dev/null 2>&1 || die "Docker tidak ditemukan."
+docker compose version >/dev/null 2>&1 || die "Docker Compose tidak tersedia."
+command -v curl >/dev/null 2>&1 || die "curl tidak ditemukan."
+command -v openssl >/dev/null 2>&1 || die "openssl tidak ditemukan."
+
+mkdir -p /etc/data "$BACKUP_ROOT"
+clear 2>/dev/null || true
+
+echo
+echo "============================================================"
+echo "          MARZBAN DOMAIN CHANGER — CLOUDFRONT"
+echo "============================================================"
+echo
+
+# ============================================================
+# DETEKSI DOMAIN LAMA
+# ============================================================
+
+CURRENT_DOMAIN=""
+
+if [ -s "$DOMAIN_FILE" ]; then
+    SAVED_DOMAIN=$(tr -d '[:space:]' < "$DOMAIN_FILE")
+    if echo "$SAVED_DOMAIN" | grep -Eq \
+        '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'; then
+        CURRENT_DOMAIN="$SAVED_DOMAIN"
+    fi
+fi
+
+if [ -z "$CURRENT_DOMAIN" ]; then
+    for CONF in "$DEFAULT_CONF" "$XRAY_CONF" "$NGINX_MAIN_CONF"; do
+        [ -f "$CONF" ] || continue
+        FOUND=$(grep -Eo \
+            'server_name[[:space:]]+[A-Za-z0-9.-]+\.[A-Za-z]{2,63}' \
+            "$CONF" 2>/dev/null |
+            head -n1 | awk '{print $2}')
+        if echo "$FOUND" | grep -Eq \
+            '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'; then
+            CURRENT_DOMAIN="$FOUND"
+            break
+        fi
+    done
+fi
+
+echo "Domain saat ini : ${CURRENT_DOMAIN:-tidak ditemukan}"
+echo
+
+# ============================================================
+# INPUT DOMAIN BARU
+# ============================================================
+
+read -r -p "Masukkan DOMAIN BARU: " NEW_DOMAIN
+
+NEW_DOMAIN=$(printf '%s' "$NEW_DOMAIN" |
+    tr '[:upper:]' '[:lower:]' |
+    sed 's/[[:space:]]//g')
+NEW_DOMAIN="${NEW_DOMAIN#http://}"
+NEW_DOMAIN="${NEW_DOMAIN#https://}"
+NEW_DOMAIN="${NEW_DOMAIN%%/*}"
+NEW_DOMAIN="${NEW_DOMAIN%.}"
+
+if ! echo "$NEW_DOMAIN" | grep -Eq \
+    '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'; then
+    die "Format domain tidak valid: $NEW_DOMAIN"
+fi
+
+CF_DOMAIN="${CF_DOMAIN_PREFIX}${NEW_DOMAIN}"
+
+echo
+echo "Domain utama   : $NEW_DOMAIN"
+echo "CloudFront     : $CF_DOMAIN"
+echo
+
+# ============================================================
+# CEK IP PUBLIK
+# ============================================================
+
+info "Mendeteksi IP publik VPS..."
+PUBLIC_IP=$(curl -4fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)
+[ -n "$PUBLIC_IP" ] || die "Gagal mendeteksi IP publik VPS."
+echo "IP VPS         : $PUBLIC_IP"
+echo
+
+# ============================================================
+# CEK DNS UNTUK KEDUA DOMAIN
+# ============================================================
+
+resolve_a() {
+    local d="$1"
+    local ip=""
+    if command -v dig >/dev/null 2>&1; then
+        ip=$(dig +short A "$d" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)
+    elif command -v getent >/dev/null 2>&1; then
+        ip=$(getent ahostsv4 "$d" 2>/dev/null | awk 'NR==1 {print $1}')
+    else
+        ip=$(curl -4fsS --max-time 10 \
+            "https://dns.google/resolve?name=$d&type=A" 2>/dev/null |
+            grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+    fi
+    printf '%s' "$ip"
+}
+
+DNS_MAIN=$(resolve_a "$NEW_DOMAIN")
+DNS_CF=$(resolve_a "$CF_DOMAIN")
+
+echo "DNS $NEW_DOMAIN : ${DNS_MAIN:-tidak ditemukan}"
+echo "DNS $CF_DOMAIN   : ${DNS_CF:-tidak ditemukan}"
+echo
+
+DNS_OK=1
+
+if [ "$DNS_MAIN" != "$PUBLIC_IP" ]; then
+    warn "A record $NEW_DOMAIN belum mengarah ke IP VPS."
+    DNS_OK=0
+fi
+
+if [ "$DNS_CF" != "$PUBLIC_IP" ]; then
+    warn "A record $CF_DOMAIN belum mengarah ke IP VPS."
+    DNS_OK=0
+fi
+
+if [ "$DNS_OK" != "1" ]; then
+    read -r -p "DNS belum sesuai. Tetap lanjut issue SSL? [y/N]: " ANSWER
+    [[ "$ANSWER" =~ ^[Yy]$ ]] || die "Dibatalkan. Perbaiki DNS terlebih dahulu."
+else
+    ok "DNS kedua domain sudah mengarah ke VPS."
+fi
+
+# ============================================================
+# KONFIRMASI
+# ============================================================
+
+echo
+echo "============================================================"
+echo "Domain lama : ${CURRENT_DOMAIN:-tidak ditemukan}"
+echo "Domain baru : $NEW_DOMAIN"
+echo "CloudFront  : $CF_DOMAIN"
+echo "============================================================"
+echo
+
+read -r -p "Lanjut mengganti domain + SSL CloudFront? [y/N]: " CONFIRM
+[[ "$CONFIRM" =~ ^[Yy]$ ]] || die "Dibatalkan."
+
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+BACKUP_DIR="$BACKUP_ROOT/$TIMESTAMP"
+mkdir -p "$BACKUP_DIR"
+
+# ============================================================
+# BACKUP LENGKAP SEBELUM PERUBAHAN
+# ============================================================
+
+info "Membuat backup konfigurasi lama..."
+
+cp -af "$XRAY_CONF" "$BACKUP_DIR/xray.conf" 2>/dev/null || true
+cp -af "$DEFAULT_CONF" "$BACKUP_DIR/default.conf" 2>/dev/null || true
+cp -af "$CF_NGINX_CONF" "$BACKUP_DIR/cloudfront-nginx.conf" 2>/dev/null || true
+cp -af "$CERT_FILE" "$BACKUP_DIR/xray.crt" 2>/dev/null || true
+cp -af "$KEY_FILE" "$BACKUP_DIR/xray.key" 2>/dev/null || true
+
+ok "Backup: $BACKUP_DIR"
+
+# ============================================================
+# ISSUE SSL BARU SECARA ATOMIC
+#
+# Nginx dihentikan hanya sementara karena mode standalone.
+# Sertifikat aktif LAMA belum disentuh.
+# ============================================================
+
+ACME_HOME="${HOME}/.acme.sh"
+ACME_BIN="$ACME_HOME/acme.sh"
+
+if [ ! -x "$ACME_BIN" ]; then
+    if command -v acme.sh >/dev/null 2>&1; then
+        ACME_BIN="$(command -v acme.sh)"
+    fi
+fi
+
+if [ ! -x "$ACME_BIN" ]; then
+    rollback
+    die "acme.sh tidak ditemukan. Sertifikat lama dipertahankan."
+fi
+
+CERT_STAGE="$BACKUP_DIR/new-cert"
+KEY_STAGE="$BACKUP_DIR/new-key"
+CHAIN_STAGE="$BACKUP_DIR/new-chain"
+mkdir -p "$CERT_STAGE" "$KEY_STAGE" "$CHAIN_STAGE"
+
+info "Menghentikan Nginx sementara untuk validasi SSL..."
+cd "$MARZBAN_DIR"
+
+docker compose stop "$NGINX_SERVICE" >/dev/null 2>&1 || true
+sleep 2
+
+# Pastikan port 80/443 benar-benar bebas.
+if ss -ltn 2>/dev/null | grep -Eq ':(80|443)[[:space:]]'; then
+    rollback
+    die "Port 80/443 masih digunakan. SSL baru tidak dipasang."
+fi
+
+info "Meminta sertifikat baru untuk:"
+echo "  - $NEW_DOMAIN"
+echo "  - $CF_DOMAIN"
+
+SSL_OK=0
+
+if "$ACME_BIN" --issue --standalone \
+    -d "$NEW_DOMAIN" \
+    -d "$CF_DOMAIN" \
+    --keylength ec-256 \
+    --server letsencrypt \
+    --force; then
+
+    ACME_DOMAIN_DIR="$ACME_HOME/${NEW_DOMAIN}_ecc"
+
+    if [ -f "$ACME_DOMAIN_DIR/fullchain.cer" ] &&
+       [ -f "$ACME_DOMAIN_DIR/${NEW_DOMAIN}.key" ]; then
+
+        cp -af "$ACME_DOMAIN_DIR/fullchain.cer" "$CERT_STAGE/xray.crt"
+        cp -af "$ACME_DOMAIN_DIR/${NEW_DOMAIN}.key" "$KEY_STAGE/xray.key"
+
+        # Verifikasi bahwa SAN benar-benar memuat kedua domain.
+        if openssl x509 -in "$CERT_STAGE/xray.crt" -noout -text 2>/dev/null |
+            grep -Fq "DNS:$NEW_DOMAIN" &&
+           openssl x509 -in "$CERT_STAGE/xray.crt" -noout -text 2>/dev/null |
+            grep -Fq "DNS:$CF_DOMAIN"; then
+            SSL_OK=1
+        fi
+    fi
+fi
+
+if [ "$SSL_OK" != "1" ]; then
+    rollback
+    die "Issue/validasi SSL gagal. Sertifikat lama dipertahankan."
+fi
+
+ok "Sertifikat baru valid untuk $NEW_DOMAIN dan $CF_DOMAIN."
+
+# ============================================================
+# PASANG SERTIFIKAT BARU
+# ============================================================
+
+install -m 600 "$CERT_STAGE/xray.crt" "$CERT_FILE"
+install -m 600 "$KEY_STAGE/xray.key" "$KEY_FILE"
+
+# ============================================================
+# UPDATE DOMAIN UTAMA
+# ============================================================
+
+update_server_name() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+
+    if grep -qE '^[[:space:]]*server_name[[:space:]]+' "$file"; then
+        sed -i -E \
+            "0,/^[[:space:]]*server_name[[:space:]]+[^;]+;/s//server_name $NEW_DOMAIN;/" \
+            "$file"
+    fi
+}
+
+update_server_name "$XRAY_CONF"
+update_server_name "$DEFAULT_CONF"
+
+# ============================================================
+# REGENERATE CLOUDFRONT NGINX CONFIG
+# Tidak mempertahankan domain lama.
+# ============================================================
+
+info "Memperbarui konfigurasi Nginx CloudFront..."
+
+cat > "$CF_NGINX_CONF" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $CF_DOMAIN;
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name $CF_DOMAIN;
+
+    ssl_certificate /var/lib/marzban/xray.crt;
+    ssl_certificate_key /var/lib/marzban/xray.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location = /vmess-cloudfront {
+        proxy_pass http://127.0.0.1:10010;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+        proxy_buffering off;
+    }
+
+    location = /vless-cloudfront {
+        proxy_pass http://127.0.0.1:10011;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+        proxy_buffering off;
+    }
+
+    location = /trojan-cloudfront {
+        proxy_pass http://127.0.0.1:10012;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+        proxy_buffering off;
+    }
+
+    location / {
+        return 404;
+    }
+}
+EOF
+
+# ============================================================
+# SIMPAN DOMAIN BARU
+# ============================================================
+
+printf '%s\n' "$NEW_DOMAIN" > "$DOMAIN_FILE"
+chmod 600 "$DOMAIN_FILE"
+
+# ============================================================
+# NGINX CONFIG TEST — WAJIB BERHASIL
+# ============================================================
+
+info "Menyalakan Nginx dengan konfigurasi baru..."
+
+docker compose up -d "$NGINX_SERVICE" >/dev/null 2>&1 || {
+    rollback
+    die "Nginx gagal dijalankan. Konfigurasi lama dipulihkan."
+}
+
+sleep 3
+
+if ! docker ps --format '{{.Names}}' | grep -qx 'marzban-nginx-1'; then
+    rollback
+    die "Container Nginx tidak aktif. Rollback dilakukan."
+fi
+
+if ! docker exec marzban-nginx-1 nginx -t >/dev/null 2>&1; then
+    rollback
+    die "nginx -t gagal. Konfigurasi lama dipulihkan."
+fi
+
+ok "nginx -t berhasil."
+
+# ============================================================
+# RELOAD NGINX
+# ============================================================
+
+docker exec marzban-nginx-1 nginx -s reload >/dev/null 2>&1 || {
+    rollback
+    die "Nginx reload gagal. Rollback dilakukan."
+}
+
+ok "Nginx reload berhasil."
+
+# ============================================================
+# UPDATE/SYNC XRAY CLOUDFRONT
+# ============================================================
+
+info "Sync user Marzban ke Xray CloudFront..."
+
+if [ -x /usr/local/bin/sync-marzban-cloudfront.py ]; then
+    /usr/local/bin/sync-marzban-cloudfront.py || {
+        rollback
+        die "Sync CloudFront gagal. Rollback dilakukan."
+    }
+fi
+
+if systemctl list-unit-files "$CF_SYNC_SERVICE" >/dev/null 2>&1; then
+    systemctl start "$CF_SYNC_SERVICE" >/dev/null 2>&1 || true
+fi
+
+if systemctl list-unit-files "$CF_XRAY_SERVICE" >/dev/null 2>&1; then
+    systemctl restart "$CF_XRAY_SERVICE" >/dev/null 2>&1 || {
+        rollback
+        die "Xray CloudFront gagal restart. Rollback dilakukan."
+    }
+fi
+
+# ============================================================
+# FINAL VERIFICATION
+# ============================================================
+
+echo
+echo "============================================================"
+echo "                 FINAL VERIFICATION"
+echo "============================================================"
+
+if systemctl is-active --quiet "$CF_XRAY_SERVICE"; then
+    ok "Xray CloudFront : ACTIVE"
+else
+    warn "Xray CloudFront : tidak aktif"
+fi
+
+if docker ps --format '{{.Names}}' | grep -qx 'marzban-nginx-1'; then
+    ok "Nginx container  : UP"
+else
+    warn "Nginx container  : DOWN"
+fi
+
+if docker exec marzban-nginx-1 nginx -t >/dev/null 2>&1; then
+    ok "Nginx config     : OK"
+else
+    rollback
+    die "Verifikasi Nginx gagal."
+fi
+
+echo
+echo "Port:"
+ss -ltnp 2>/dev/null |
+    grep -E ':(80|443|10010|10011|10012)[[:space:]]' || true
+
+echo
+echo "Certificate SAN:"
+openssl x509 -in "$CERT_FILE" -noout -ext subjectAltName 2>/dev/null || true
+
+echo
+echo "============================================================"
+echo "             GANTI DOMAIN BERHASIL"
+echo "============================================================"
+echo "Domain baru : $NEW_DOMAIN"
+echo "CloudFront  : $CF_DOMAIN"
+echo "SSL         : $CERT_FILE"
+echo "Backup      : $BACKUP_DIR"
+echo
+echo "Catatan:"
+echo "  - Sertifikat lama sudah digantikan setelah SSL baru valid."
+echo "  - Nginx hanya direload setelah nginx -t sukses."
+echo "  - Jika proses gagal sebelum tahap final, konfigurasi lama dipulihkan."
+echo "============================================================"
