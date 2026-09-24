@@ -7,8 +7,6 @@ set -u
 
 DATA_DIR="/etc/data"
 CONFIG_FILE="${DATA_DIR}/telegram_config.conf"
-# SINGLE SOURCE OF TRUTH: BWBOT reads botToken/chatId from this file.
-PASS_FILE="${DATA_DIR}/passbackup"
 NAME_FILE="${DATA_DIR}/nama"
 FILE_ID_FILE="${DATA_DIR}/file_id.txt"
 LOG_FILE="${DATA_DIR}/log-backup.txt"
@@ -110,16 +108,10 @@ backup_and_send_telegram() {
 
     load_telegram_config || return 1
 
-    if [ ! -s "$PASS_FILE" ]; then
-        red "Password backup tidak ditemukan: $PASS_FILE"
-        return 1
-    fi
-
     check_requirements || return 1
 
-    local InputPass nama tanggal tanggal2 waktu curdir response ok file_id
+    local nama tanggal tanggal2 waktu curdir response ok file_id
     local IP_ADDRESS CLIENT_NAME_ESCAPED IP_ADDRESS_ESCAPED CAPTION
-    InputPass="$(head -n 1 "$PASS_FILE")"
     nama="$(get_server_name)"
     tanggal="$(date '+%m-%d-%Y')"
     tanggal2="$(date '+%m%d%Y')"
@@ -150,7 +142,7 @@ backup_and_send_telegram() {
     curdir="/root/${nama}_${waktu}_${tanggal2}.zip"
     rm -f "$curdir"
 
-    if ! (cd /root && zip -r -q -P "$InputPass" "$(basename "$curdir")" "$(basename "$BACKUP_DIR")"); then
+    if ! (cd /root && zip -r -q "$(basename "$curdir")" "$(basename "$BACKUP_DIR")"); then
         red "Gagal membuat file ZIP."
         rm -rf "$BACKUP_DIR"
         return 1
@@ -275,27 +267,56 @@ restore_from_telegram() {
 
     load_telegram_config || return 1
 
-    # Restore lintas VPS TIDAK menggunakan passbackup/File ID milik VPS baru.
-    # User memasukkan File ID backup lama dan password yang dipakai saat backup lama.
-    local FILE_ID InputPass FILE_PATH TMP_DIR ZIP_FILE ROOT DB_FILE
+    # Restore lintas VPS menggunakan File ID Telegram.
+    # Backup dibuat TANPA password, jadi restore juga tidak meminta password.
+    local FILE_ID FILE_PATH TMP_DIR ZIP_FILE ROOT DB_FILE
     local SAFETY_DIR COMPOSE_DIR CONTAINER_NAMES
 
-    echo "=== RESTORE BACKUP DARI VPS LAMA ==="
+    echo "=== RESTORE BACKUP DARI TELEGRAM ==="
     echo
-    echo "Masukkan File ID dari backup Telegram VPS lama."
-    echo "Contoh: 1234567890"
-    read -r -p "File ID: " FILE_ID
+    echo "Mode otomatis: mencari backup terbaru dari Telegram..."
 
-    if [ -z "$FILE_ID" ]; then
-        red "File ID tidak boleh kosong."
-        return 1
+    # Prioritas 1: gunakan File ID backup terakhir yang tersimpan lokal.
+    FILE_ID=""
+    if [ -s "$FILE_ID_FILE" ]; then
+        FILE_ID="$(awk -F'File ID: ' '/^File ID: / {id=$2} END {print id}' "$FILE_ID_FILE")"
     fi
 
-    read -r -s -p "Password ZIP backup VPS lama: " InputPass
-    echo
+    # Prioritas 2: jika VPS baru belum mempunyai riwayat File ID,
+    # ambil dokumen backup terbaru yang dikirim/diteruskan ke bot.
+    if [ -z "$FILE_ID" ]; then
+        echo "File ID lokal tidak ditemukan."
+        echo "Silakan teruskan/kirim file backup ZIP ke bot Telegram ini."
+        echo "Script akan mendeteksi file ZIP terbaru secara otomatis."
+        echo
 
-    if [ -z "$InputPass" ]; then
-        red "Password backup tidak boleh kosong."
+        local TG_UPDATES UPDATE_FILE_ID UPDATE_FILE_NAME UPDATE_DATE LAST_UPDATE_ID
+        TG_UPDATES="$(curl -fsS --connect-timeout 15 --max-time 60 \
+            "https://api.telegram.org/bot${botToken}/getUpdates?limit=100" \
+            2>/dev/null || true)"
+
+        if [ -n "$TG_UPDATES" ] && [ "$(printf '%s' "$TG_UPDATES" | jq -r '.ok // false' 2>/dev/null)" = "true" ]; then
+            UPDATE_FILE_ID="$(printf '%s' "$TG_UPDATES" | jq -r '[.result[] | .message.document? // empty | select(.file_id != null) | {file_id,file_name,date}] | sort_by(.date) | last | .file_id // empty' 2>/dev/null)"
+            UPDATE_FILE_NAME="$(printf '%s' "$TG_UPDATES" | jq -r '[.result[] | .message.document? // empty | select(.file_id != null) | {file_id,file_name,date}] | sort_by(.date) | last | .file_name // empty' 2>/dev/null)"
+            LAST_UPDATE_ID="$(printf '%s' "$TG_UPDATES" | jq -r '[.result[].update_id] | max // empty' 2>/dev/null)"
+
+            if [ -n "$UPDATE_FILE_ID" ]; then
+                FILE_ID="$UPDATE_FILE_ID"
+                echo "Backup otomatis terdeteksi: ${UPDATE_FILE_NAME:-backup.zip}"
+
+                # Tandai update yang sudah diproses agar tidak dipilih lagi pada restore berikutnya.
+                if [ -n "$LAST_UPDATE_ID" ]; then
+                    curl -fsS --connect-timeout 15 --max-time 30 \
+                        "https://api.telegram.org/bot${botToken}/getUpdates?offset=$((LAST_UPDATE_ID + 1))&limit=1" \
+                        >/dev/null 2>&1 || true
+                fi
+            fi
+        fi
+    fi
+
+    if [ -z "$FILE_ID" ]; then
+        red "Backup otomatis belum ditemukan di Telegram."
+        echo "Kirim/teruskan file ZIP backup ke bot Telegram, lalu pilih Restore lagi."
         return 1
     fi
 
@@ -315,8 +336,16 @@ restore_from_telegram() {
     }
     trap cleanup_restore RETURN
 
+    # Simpan File ID yang terdeteksi agar restore berikutnya tidak perlu input manual.
+    if ! grep -qF "File ID: $FILE_ID" "$FILE_ID_FILE" 2>/dev/null; then
+        printf '### auto-detected-restore
+File ID: %s
+Server backup ditemukan otomatis dari Telegram.
+' "$FILE_ID" >> "$FILE_ID_FILE"
+    fi
+
     echo
-    echo "[1/6] Memeriksa File ID Telegram..."
+    echo "[1/6] Memeriksa backup Telegram..."
 
     local TG_RESPONSE
     TG_RESPONSE="$(
@@ -355,17 +384,16 @@ restore_from_telegram() {
         return 1
     }
 
-    echo "[3/6] Memeriksa password dan isi ZIP..."
+    echo "[3/6] Memeriksa isi ZIP tanpa password..."
 
-    if ! unzip -t -q -P "$InputPass" "$ZIP_FILE" >/dev/null 2>&1; then
-        red "Password SALAH atau file ZIP rusak."
-        red "Gunakan password yang dipakai di VPS LAMA saat membuat backup."
+    if ! unzip -t -q "$ZIP_FILE" >/dev/null 2>&1; then
+        red "File ZIP rusak atau tidak valid."
         return 1
     fi
 
     mkdir -p "$TMP_DIR/extracted"
 
-    if ! unzip -q -P "$InputPass" "$ZIP_FILE" -d "$TMP_DIR/extracted"; then
+    if ! unzip -q "$ZIP_FILE" -d "$TMP_DIR/extracted"; then
         red "Gagal mengekstrak backup."
         return 1
     fi
