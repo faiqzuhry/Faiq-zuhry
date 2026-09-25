@@ -7,7 +7,9 @@ CERT_FILE="/var/lib/marzban/xray.crt"
 KEY_FILE="/var/lib/marzban/xray.key"
 DOMAIN_FILE="/etc/data/domain"
 BACKUP_ROOT="/opt/marzban/domain-backups"
+ORIGIN_DOMAIN_PREFIX="origin."
 CF_DOMAIN_PREFIX="cf."
+CLOUDFRONT_DOMAIN_FILE="/etc/data/cloudfront_distribution_domain"
 CF_NGINX_CONF="/opt/marzban/cloudfront-nginx.conf"
 CF_XRAY_SERVICE="xray-cloudfront.service"
 CF_API_CONF="/etc/data/cloudflare_dns.conf"
@@ -247,50 +249,78 @@ cf_upsert_a() {
     fi
 }
 
+cf_upsert_cname() {
+    local name="$1" target="$2" proxied="${3:-false}" records_json rid body result
+    records_json=$(cf_find_all_name "$name") || die "Gagal membaca DNS $name dari Cloudflare."
+    rid=$(printf '%s' "$records_json" | jq -r '.result[] | select(.type == "CNAME") | .id' | head -n1)
+
+    if [ -z "$rid" ]; then
+        while IFS=$'\t' read -r type old_id; do
+            [ -n "$old_id" ] || continue
+            case "$type" in
+                A|AAAA)
+                    result=$(cf_api DELETE "$CF_API_BASE/zones/$CLOUDFLARE_ZONE_ID/dns_records/$old_id" 2>/dev/null || true)
+                    cf_json_ok "$result" || die "Gagal menghapus record konflik $type $name."
+                    ;;
+            esac
+        done < <(printf '%s' "$records_json" | jq -r '.result[] | [.type,.id] | @tsv')
+    fi
+
+    body=$(jq -nc --arg name "$name" --arg target "$target" --argjson proxied "$proxied" \
+        '{type:"CNAME",name:$name,content:$target,ttl:1,proxied:$proxied}')
+
+    if [ -n "$rid" ]; then
+        result=$(cf_api PUT "$CF_API_BASE/zones/$CLOUDFLARE_ZONE_ID/dns_records/$rid" "$body") || die "Gagal update CNAME $name."
+    else
+        result=$(cf_api POST "$CF_API_BASE/zones/$CLOUDFLARE_ZONE_ID/dns_records" "$body") || die "Gagal membuat CNAME $name."
+    fi
+    cf_json_ok "$result" || {
+        echo "Cloudflare response: $result" >&2
+        die "Cloudflare menolak perubahan CNAME $name."
+    }
+    ok "Cloudflare CNAME $name → $target 🔘 (DNS Only)"
+}
+
 cloudflare_sync_dns() {
     load_cf_credentials
-    local cf_backup_file="$BACKUP_ROOT/cloudflare-$NEW_DOMAIN-$(date +%Y%m%d-%H%M%S).json"
+
+    [ -n "${CLOUDFRONT_DISTRIBUTION_DOMAIN:-}" ] ||
+        die "CloudFront distribution domain belum ditentukan."
+
+    local cf_backup_file="$BACKUP_ROOT/cloudfront-dns-$NEW_DOMAIN-$(date +%Y%m%d-%H%M%S).json"
     mkdir -p "$BACKUP_ROOT"
+
     {
-        printf '{"zone_id":"%s","zone_name":"%s","records":[' "$CLOUDFLARE_ZONE_ID" "$NEW_DOMAIN"
-        cf_find_all_name "$NEW_DOMAIN" | jq -c '.result[]' 2>/dev/null | paste -sd, -
+        printf '{"zone_id":"%s","zone_name":"%s","origin_domain":"%s","cf_domain":"%s","cloudfront_distribution":"%s","records":[' \
+            "$CLOUDFLARE_ZONE_ID" "$NEW_DOMAIN" "$ORIGIN_DOMAIN" "$CF_DOMAIN" "$CLOUDFRONT_DISTRIBUTION_DOMAIN"
+        cf_find_all_name "$ORIGIN_DOMAIN" | jq -c '.result[]' 2>/dev/null | paste -sd, -
         printf '],"cf_records":['
         cf_find_all_name "$CF_DOMAIN" | jq -c '.result[]' 2>/dev/null | paste -sd, -
         printf ']}'
     } > "$cf_backup_file"
     chmod 600 "$cf_backup_file"
-    ok "Backup DNS Cloudflare @ + cf: $cf_backup_file"
+    ok "Backup DNS origin + CloudFront: $cf_backup_file"
 
-    info "Sinkronisasi DNS Cloudflare: hanya domain utama + CF..."
-    echo "  @       → $ORIGIN_IP 🔘 (DNS Only)"
-    echo "  cf      → $ORIGIN_IP 🔘 (DNS Only selama proses SSL)"
-    echo "  wildcard/CNAME → TIDAK disentuh"
+    echo
+    info "Sinkronisasi DNS untuk AWS CloudFront..."
+    echo "  $ORIGIN_DOMAIN → $ORIGIN_IP 🔘 (DNS Only)"
+    echo "  $CF_DOMAIN → $CLOUDFRONT_DISTRIBUTION_DOMAIN 🔘 (CNAME, DNS Only)"
+    echo "  Wildcard/CNAME lain → TIDAK disentuh"
     echo
 
-    cf_upsert_a "$NEW_DOMAIN" "$ORIGIN_IP" "false"
-    cf_upsert_a "$CF_DOMAIN" "$ORIGIN_IP" "false"
-    ok "DNS Cloudflare domain utama + CF sudah disinkronkan."
-    ok "Wildcard/CNAME yang sudah ada tidak diubah."
+    # Origin VPS: harus langsung menuju IP VPS, DNS Only.
+    cf_upsert_a "$ORIGIN_DOMAIN" "$ORIGIN_IP" "false"
+
+    # Viewer hostname: harus menunjuk ke distribution AWS CloudFront.
+    cf_upsert_cname "$CF_DOMAIN" "$CLOUDFRONT_DISTRIBUTION_DOMAIN" "false"
+
+    ok "DNS origin + CloudFront sudah disinkronkan."
 }
 
 cf_restore_proxy_on_exit() {
-    # Jika proses mati sebelum SSL selesai, jangan meninggalkan cf DNS-only.
-    if [ "${CF_TEMPORARY_DNS_ONLY:-0}" = "1" ] &&
-       [ -n "${CLOUDFLARE_ZONE_ID:-}" ] &&
-       [ -n "${CLOUDFLARE_API_TOKEN:-}" ] &&
-       [ -n "${CF_DOMAIN:-}" ] &&
-       [ -n "${ORIGIN_IP:-}" ]; then
-        local rec id body result
-        rec=$(cf_find_all_name "$CF_DOMAIN" 2>/dev/null || true)
-        id=$(printf '%s' "$rec" | jq -r '.result[] | select(.type == "A") | .id' | head -n1)
-        if [ -n "$id" ]; then
-            body=$(jq -nc --arg name "$CF_DOMAIN" --arg ip "$ORIGIN_IP" '{type:"A",name:$name,content:$ip,ttl:1,proxied:true}')
-            result=$(cf_api PUT "$CF_API_BASE/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" "$body" 2>/dev/null || true)
-            if cf_json_ok "$result"; then
-                warn "Cloudflare Proxy $CF_DOMAIN dipulihkan otomatis setelah proses gagal."
-            fi
-        fi
-    fi
+    # AWS CloudFront memakai CNAME DNS Only.
+    # Tidak ada proses mengaktifkan Cloudflare Proxy/orange-cloud.
+    return 0
 }
 
 trap cf_restore_proxy_on_exit EXIT
@@ -376,7 +406,30 @@ if ! echo "$NEW_DOMAIN" | grep -Eq \
     die "Format domain tidak valid: $NEW_DOMAIN"
 fi
 
+ORIGIN_DOMAIN="${ORIGIN_DOMAIN_PREFIX}${NEW_DOMAIN}"
 CF_DOMAIN="${CF_DOMAIN_PREFIX}${NEW_DOMAIN}"
+
+# Domain AWS CloudFront distribution.
+# Simpan agar ganti_domain berikutnya tidak perlu meminta ulang.
+CLOUDFRONT_DISTRIBUTION_DOMAIN=""
+if [ -s "$CLOUDFRONT_DOMAIN_FILE" ]; then
+    CLOUDFRONT_DISTRIBUTION_DOMAIN="$(tr -d '[:space:]' < "$CLOUDFRONT_DOMAIN_FILE")"
+fi
+
+if ! printf '%s' "$CLOUDFRONT_DISTRIBUTION_DOMAIN" | grep -Eq     '^[a-z0-9-]+\.cloudfront\.net$'; then
+    echo
+    echo "CloudFront AWS sekarang menggunakan CNAME:"
+    echo "  $CF_DOMAIN → xxxxx.cloudfront.net"
+    read -r -p "Masukkan domain distribution CloudFront AWS: " CLOUDFRONT_DISTRIBUTION_DOMAIN
+    CLOUDFRONT_DISTRIBUTION_DOMAIN="$(printf '%s' "$CLOUDFRONT_DISTRIBUTION_DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's/[[:space:]]//g')"
+fi
+
+if ! printf '%s' "$CLOUDFRONT_DISTRIBUTION_DOMAIN" | grep -Eq     '^[a-z0-9-]+\.cloudfront\.net$'; then
+    die "Domain distribution CloudFront tidak valid: $CLOUDFRONT_DISTRIBUTION_DOMAIN"
+fi
+
+printf '%s\n' "$CLOUDFRONT_DISTRIBUTION_DOMAIN" > "$CLOUDFRONT_DOMAIN_FILE"
+chmod 600 "$CLOUDFRONT_DOMAIN_FILE"
 
 # ============================================================
 # CLOUDFLARE + IP ORIGIN LAMA
@@ -390,9 +443,13 @@ OLD_ZONE_NAME=$(printf '%s' "$OLD_ZONE_INFO" | awk -F '\t' 'NR==1{print $2}')
 [ -n "$OLD_ZONE_ID" ] || die "Root Zone Cloudflare untuk hostname lama $CURRENT_DOMAIN tidak ditemukan."
 ok "Root Zone lama: $OLD_ZONE_NAME (hostname: $CURRENT_DOMAIN)"
 
-info "Mengambil IP origin dari hostname lama $CURRENT_DOMAIN..."
-ORIGIN_IP=$(get_old_origin_ip "$CURRENT_DOMAIN" "$OLD_ZONE_ID") || \
-    die "Tidak dapat mengambil IP origin dari $CURRENT_DOMAIN."
+OLD_ORIGIN_DOMAIN="origin.${CURRENT_DOMAIN}"
+info "Mengambil IP origin dari hostname lama $OLD_ORIGIN_DOMAIN..."
+ORIGIN_IP=$(get_old_origin_ip "$OLD_ORIGIN_DOMAIN" "$OLD_ZONE_ID" 2>/dev/null) || {
+    warn "A $OLD_ORIGIN_DOMAIN tidak ditemukan. Mencoba fallback ke $CURRENT_DOMAIN..."
+    ORIGIN_IP=$(get_old_origin_ip "$CURRENT_DOMAIN" "$OLD_ZONE_ID") ||
+        die "Tidak dapat mengambil IP origin dari $OLD_ORIGIN_DOMAIN maupun $CURRENT_DOMAIN."
+}
 
 PUBLIC_IP=$(curl -4fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)
 printf 'IP origin lama : %s\n' "$ORIGIN_IP"
@@ -458,116 +515,48 @@ cf_a_records_authoritative() {
 
 info "Mengecek DNS authoritative Cloudflare..."
 
-CF_MAIN_AUTH=$(cf_a_records_authoritative "$NEW_DOMAIN" || true)
-CF_CF_AUTH=$(cf_a_records_authoritative "$CF_DOMAIN" || true)
-
-CF_MAIN_IP=$(printf '%s\n' "$CF_MAIN_AUTH" |
-    awk -F '\t' -v ip="$ORIGIN_IP" '$2 == ip {print $2; exit}')
-
-CF_CF_IP=$(printf '%s\n' "$CF_CF_AUTH" |
-    awk -F '\t' -v ip="$ORIGIN_IP" '$2 == ip {print $2; exit}')
-
-CF_CF_ID=$(printf '%s\n' "$CF_CF_AUTH" |
-    awk -F '\t' '$2 != "" {print $1; exit}')
-
-CF_CF_PROXIED=$(printf '%s\n' "$CF_CF_AUTH" |
-    awk -F '\t' -v ip="$ORIGIN_IP" '$2 == ip {print $3; exit}')
+CF_ORIGIN_AUTH=$(cf_a_records_authoritative "$ORIGIN_DOMAIN" || true)
 
 echo
 echo "=== CLOUDFLARE AUTHORITATIVE ==="
-echo "Domain utama : $NEW_DOMAIN"
-echo "  A → ${CF_MAIN_IP:-TIDAK SESUAI}"
-echo "CF domain    : $CF_DOMAIN"
-echo "  A → ${CF_CF_IP:-TIDAK SESUAI}"
-echo "  Proxy       : ${CF_CF_PROXIED:-unknown}"
+echo "Origin       : $ORIGIN_DOMAIN"
+echo "  A → ${CF_ORIGIN_AUTH:-TIDAK ADA}"
+echo "CloudFront   : $CF_DOMAIN"
+echo "  CNAME → $CLOUDFRONT_DISTRIBUTION_DOMAIN"
+echo "  Proxy       : DNS Only 🔘"
 echo
 
-# Cloudflare API adalah sumber kebenaran untuk record yang baru saja diubah.
-if [ "$CF_MAIN_IP" = "$ORIGIN_IP" ]; then
-    ok "Cloudflare authoritative $NEW_DOMAIN → $ORIGIN_IP."
+CF_ORIGIN_IP=$(printf '%s\n' "$CF_ORIGIN_AUTH" |
+    awk -F '\t' -v ip="$ORIGIN_IP" '$2 == ip {print $2; exit}')
+
+if [ "$CF_ORIGIN_IP" = "$ORIGIN_IP" ]; then
+    ok "Cloudflare authoritative $ORIGIN_DOMAIN → $ORIGIN_IP."
 else
-    error "Cloudflare authoritative $NEW_DOMAIN belum mengarah ke $ORIGIN_IP."
-    echo "Record A yang terbaca:"
-    printf '%s\n' "${CF_MAIN_AUTH:-tidak ada}" | sed 's/\t/ → /g'
-    die "Record DNS utama Cloudflare tidak sesuai."
+    error "Cloudflare authoritative $ORIGIN_DOMAIN belum mengarah ke $ORIGIN_IP."
+    printf '%s\n' "${CF_ORIGIN_AUTH:-tidak ada}" | sed 's/\t/ → /g'
+    die "Record DNS origin CloudFront tidak sesuai."
 fi
 
-if [ "$CF_CF_IP" = "$ORIGIN_IP" ]; then
-    ok "Cloudflare authoritative $CF_DOMAIN → $ORIGIN_IP."
+CF_CF_AUTH_ALL=$(cf_find_all_name "$CF_DOMAIN" 2>/dev/null || true)
+CF_CF_CNAME=$(printf '%s' "$CF_CF_AUTH_ALL" |
+    jq -r '.result[] | select(.type=="CNAME") | .content' | head -n1)
+
+if [ "$CF_CF_CNAME" = "$CLOUDFRONT_DISTRIBUTION_DOMAIN" ]; then
+    ok "Cloudflare authoritative $CF_DOMAIN → $CLOUDFRONT_DISTRIBUTION_DOMAIN 🔘."
 else
-    error "Cloudflare authoritative $CF_DOMAIN belum mengarah ke $ORIGIN_IP."
-    echo "Record A yang terbaca:"
-    printf '%s\n' "${CF_CF_AUTH:-tidak ada}" | sed 's/\t/ → /g'
-    die "Record DNS CF Cloudflare tidak sesuai."
+    warn "$CF_DOMAIN belum menunjuk ke CloudFront distribution. Sinkronisasi akan memperbaikinya."
 fi
 
-# SSL standalone membutuhkan cf DNS Only.
-# Jika ternyata record berubah menjadi Proxied, matikan proxy sementara.
-if [ "$CF_CF_PROXIED" = "true" ]; then
-    warn "$CF_DOMAIN masih PROXIED 🟠. Mengubah sementara menjadi DNS Only..."
-
-    [ -n "$CF_CF_ID" ] ||
-        die "ID record A $CF_DOMAIN tidak ditemukan."
-
-    CF_BODY=$(jq -nc \
-        --arg name "$CF_DOMAIN" \
-        --arg ip "$ORIGIN_IP" \
-        '{type:"A",name:$name,content:$ip,ttl:1,proxied:false}')
-
-    CF_RESULT=$(cf_api PUT \
-        "$CF_API_BASE/zones/$CLOUDFLARE_ZONE_ID/dns_records/$CF_CF_ID" \
-        "$CF_BODY") ||
-        die "Gagal mematikan Proxy $CF_DOMAIN."
-
-    cf_json_ok "$CF_RESULT" ||
-        die "Cloudflare menolak DNS Only untuk $CF_DOMAIN."
-
-    ok "$CF_DOMAIN sekarang DNS Only untuk proses SSL."
-    CF_TEMPORARY_DNS_ONLY=1
-fi
-
-# Resolver publik hanya sebagai informasi propagasi.
-# Hasil lama TIDAK dianggap sebagai record Cloudflare yang salah.
 info "Mengecek DNS publik (informasi propagasi)..."
-
-DNS_MAIN_LIST=$(resolve_a_all "$NEW_DOMAIN")
+DNS_ORIGIN_LIST=$(resolve_a_all "$ORIGIN_DOMAIN")
 DNS_CF_LIST=$(resolve_a_all "$CF_DOMAIN")
 
 echo
 echo "=== DNS PUBLIC ==="
-echo "Domain utama : $NEW_DOMAIN"
-echo "DNS          : ${DNS_MAIN_LIST:-belum terlihat}"
+echo "Origin       : $ORIGIN_DOMAIN"
+echo "DNS          : ${DNS_ORIGIN_LIST:-belum terlihat}"
 echo "CloudFront   : $CF_DOMAIN"
-echo "DNS CF       : ${DNS_CF_LIST:-belum terlihat}"
-echo
-
-PUBLIC_MAIN_OK=0
-PUBLIC_CF_OK=0
-
-if printf '%s\n' "$DNS_MAIN_LIST" | grep -Fxq "$ORIGIN_IP"; then
-    PUBLIC_MAIN_OK=1
-    ok "DNS publik $NEW_DOMAIN sudah melihat IP origin."
-else
-    warn "DNS publik $NEW_DOMAIN belum melihat IP origin."
-    echo "      Ini bisa normal karena cache/propagasi DNS."
-fi
-
-if printf '%s\n' "$DNS_CF_LIST" | grep -Fxq "$ORIGIN_IP"; then
-    PUBLIC_CF_OK=1
-    ok "DNS publik $CF_DOMAIN sudah melihat IP origin."
-else
-    warn "DNS publik $CF_DOMAIN belum melihat IP origin."
-    echo "      Cloudflare authoritative sudah benar; resolver publik bisa masih cache IP lama."
-fi
-
-echo
-if [ "$PUBLIC_MAIN_OK" = "1" ] && [ "$PUBLIC_CF_OK" = "1" ]; then
-    ok "DNS publik dan Cloudflare authoritative sudah sinkron."
-else
-    warn "Cloudflare authoritative SUDAH benar, tetapi DNS publik belum sepenuhnya propagasi."
-    warn "Script tidak membatalkan proses hanya karena resolver publik masih membaca IP lama."
-fi
-
+echo "DNS          : ${DNS_CF_LIST:-belum terlihat}"
 echo
 
 # ============================================================
@@ -691,52 +680,22 @@ sleep 2
 # ============================================================
 
 echo
-info "Menjalankan fix-ssl otomatis..."
+info "Memeriksa SSL origin untuk AWS CloudFront..."
 
-if command -v fix-ssl >/dev/null 2>&1; then
+# AWS CloudFront melakukan TLS ke custom origin:
+# origin.<domain>:443. Karena itu sertifikat VPS cukup mencakup ORIGIN_DOMAIN.
+# Sertifikat viewer untuk cf.<domain> berada di AWS ACM, bukan di VPS.
 
-    if fix-ssl; then
-        ok "fix-ssl selesai dengan sukses."
-    else
-        warn "fix-ssl gagal."
-
-        # Kembalikan domain file ke domain sebelumnya jika tersedia.
-        if [ -n "$CURRENT_DOMAIN" ]; then
-            printf '%s\n' "$CURRENT_DOMAIN" > "$DOMAIN_FILE"
-        fi
-
-        cp -a "$BACKUP_DIR/xray.conf" "$XRAY_CONF" 2>/dev/null || true
-        cp -a "$BACKUP_DIR/default.conf" "$DEFAULT_CONF" 2>/dev/null || true
-
-        docker compose up -d nginx marzban >/dev/null 2>&1 || true
-
-        die "Domain tidak diterapkan karena SSL gagal."
-    fi
-
-else
-    warn "fix-ssl tidak ditemukan."
-    die "fix-ssl wajib tersedia untuk mengganti domain."
-fi
-
-# ============================================================
-# PASTIKAN SSL MENCAKUP CLOUDFRONT
-# Xray CloudFront hari ini memakai cf.<domain> pada port 443.
-# Sertifikat wajib memiliki SAN untuk domain utama DAN CF_DOMAIN.
-# ============================================================
-
-info "Memeriksa SAN SSL untuk CloudFront..."
-
-CERT_SAN_OK=0
+CERT_ORIGIN_OK=0
 if [ -f "$CERT_FILE" ] &&
-   openssl x509 -in "$CERT_FILE" -noout -text 2>/dev/null | grep -Fq "DNS:$NEW_DOMAIN" &&
-   openssl x509 -in "$CERT_FILE" -noout -text 2>/dev/null | grep -Fq "DNS:$CF_DOMAIN"; then
-    CERT_SAN_OK=1
+   openssl x509 -in "$CERT_FILE" -noout -text 2>/dev/null | grep -Fq "DNS:$ORIGIN_DOMAIN"; then
+    CERT_ORIGIN_OK=1
 fi
 
-if [ "$CERT_SAN_OK" = "1" ]; then
-    ok "SSL SAN sudah mencakup $NEW_DOMAIN + $CF_DOMAIN."
+if [ "$CERT_ORIGIN_OK" = "1" ]; then
+    ok "SSL VPS sudah mencakup origin $ORIGIN_DOMAIN."
 else
-    warn "SSL saat ini belum mencakup $CF_DOMAIN. Menerbitkan sertifikat gabungan..."
+    warn "SSL VPS belum mencakup $ORIGIN_DOMAIN. Menerbitkan sertifikat origin..."
 
     docker compose stop nginx >/dev/null 2>&1 || true
     sleep 2
@@ -747,46 +706,34 @@ else
         ACME_BIN="$(command -v acme.sh)"
     fi
 
-    [ -x "$ACME_BIN" ] || die "acme.sh tidak ditemukan untuk menerbitkan SSL CloudFront."
+    [ -x "$ACME_BIN" ] || die "acme.sh tidak ditemukan untuk SSL origin CloudFront."
 
-    ACME_DOMAIN_DIR="$ACME_HOME/${NEW_DOMAIN}_ecc"
+    ACME_DOMAIN_DIR="$ACME_HOME/${ORIGIN_DOMAIN}_ecc"
     if ! "$ACME_BIN" --issue --standalone \
-        -d "$NEW_DOMAIN" \
-        -d "$CF_DOMAIN" \
+        -d "$ORIGIN_DOMAIN" \
         --keylength ec-256 \
         --server letsencrypt \
         --force; then
-        die "SSL gabungan $NEW_DOMAIN + $CF_DOMAIN gagal diterbitkan."
+        die "SSL origin $ORIGIN_DOMAIN gagal diterbitkan."
     fi
 
-    if [ ! -f "$ACME_DOMAIN_DIR/fullchain.cer" ] || [ ! -f "$ACME_DOMAIN_DIR/${NEW_DOMAIN}.key" ]; then
-        die "File sertifikat CloudFront tidak ditemukan setelah issue SSL."
+    if [ ! -f "$ACME_DOMAIN_DIR/fullchain.cer" ] || [ ! -f "$ACME_DOMAIN_DIR/${ORIGIN_DOMAIN}.key" ]; then
+        die "File sertifikat origin tidak ditemukan setelah issue SSL."
     fi
 
     install -m 600 "$ACME_DOMAIN_DIR/fullchain.cer" "$CERT_FILE"
-    install -m 600 "$ACME_DOMAIN_DIR/${NEW_DOMAIN}.key" "$KEY_FILE"
+    install -m 600 "$ACME_DOMAIN_DIR/${ORIGIN_DOMAIN}.key" "$KEY_FILE"
 
-    if ! openssl x509 -in "$CERT_FILE" -noout -text 2>/dev/null | grep -Fq "DNS:$CF_DOMAIN"; then
-        die "Sertifikat baru tidak memiliki SAN $CF_DOMAIN."
-    fi
+    openssl x509 -in "$CERT_FILE" -noout -text 2>/dev/null |
+        grep -Fq "DNS:$ORIGIN_DOMAIN" ||
+        die "Sertifikat baru tidak memiliki SAN $ORIGIN_DOMAIN."
 
-    ok "SSL CloudFront berhasil diterbitkan untuk $NEW_DOMAIN + $CF_DOMAIN."
+    ok "SSL origin berhasil diterbitkan untuk $ORIGIN_DOMAIN."
 fi
 
-# ============================================================
-# RESTORE CLOUDFLARE PROXY SETELAH SSL BERHASIL
-# ============================================================
-# cf kembali orange-cloud agar origin tidak terekspos melalui record cf.
-info "Mengembalikan CloudFront ke Cloudflare Proxy..."
-CF_RECORDS=$(cf_find_all_name "$CF_DOMAIN") || die "Gagal membaca record $CF_DOMAIN saat restore Proxy."
-CF_ID=$(printf '%s' "$CF_RECORDS" | jq -r '.result[] | select(.type == "A") | .id' | head -n1)
-if [ -n "$CF_ID" ]; then
-    CF_BODY=$(jq -nc --arg name "$CF_DOMAIN" --arg ip "$ORIGIN_IP" '{type:"A",name:$name,content:$ip,ttl:1,proxied:true}')
-    CF_RESULT=$(cf_api PUT "$CF_API_BASE/zones/$CLOUDFLARE_ZONE_ID/dns_records/$CF_ID" "$CF_BODY") || die "Gagal mengaktifkan kembali Proxy $CF_DOMAIN."
-    cf_json_ok "$CF_RESULT" || die "Cloudflare menolak restore Proxy $CF_DOMAIN."
-    ok "$CF_DOMAIN kembali PROXIED 🟠."
-    CF_TEMPORARY_DNS_ONLY=0
-fi
+# Tidak ada Cloudflare orange-cloud di sini.
+# cf.<domain> tetap DNS Only dan CNAME ke AWS CloudFront.
+ok "$CF_DOMAIN tetap DNS Only 🔘 → $CLOUDFRONT_DISTRIBUTION_DOMAIN."
 
 # ============================================================
 # TUNGGU MARZBAN SIAP
@@ -860,15 +807,16 @@ echo "============================================================"
 echo "             GANTI DOMAIN SELESAI"
 echo "============================================================"
 echo
-echo "Domain baru : $NEW_DOMAIN"
-echo "CloudFront  : $CF_DOMAIN (Proxy 🟠)"
-echo "SSL         : $CERT_FILE"
+echo "Domain utama : $NEW_DOMAIN"
+echo "Origin       : $ORIGIN_DOMAIN → $ORIGIN_IP 🔘"
+echo "CloudFront   : $CF_DOMAIN → $CLOUDFRONT_DISTRIBUTION_DOMAIN 🔘"
+echo "SSL origin   : $CERT_FILE"
 echo "Backup      : $BACKUP_DIR"
 echo "CF API      : $CF_API_CONF"
 echo "Wildcard    : TIDAK disentuh"
 echo
 echo "Cloudflare otomatis:"
-echo "  @      → $ORIGIN_IP 🔘 (DNS Only)"
-echo "  cf     → $ORIGIN_IP 🟠 (Proxied setelah SSL)"
+echo "  $ORIGIN_DOMAIN → $ORIGIN_IP 🔘 (DNS Only)"
+echo "  $CF_DOMAIN → $CLOUDFRONT_DISTRIBUTION_DOMAIN 🔘 (CNAME / DNS Only)"
 echo
 echo "============================================================"

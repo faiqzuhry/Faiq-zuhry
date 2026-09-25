@@ -1380,6 +1380,7 @@ setup_xray_cloudfront() {
     local CF_DOMAIN="cf.${domain}"
     local CF_DIR="/var/lib/marzban/cloudfront"
     local CF_CONFIG="${CF_DIR}/config.json"
+    local CF_STATE="${CF_DIR}/active-users.json"
     local CF_SYNC="/usr/local/bin/sync-marzban-cloudfront.py"
     local CF_SERVICE="/etc/systemd/system/xray-cloudfront.service"
     local CF_SYNC_SERVICE="/etc/systemd/system/marzban-cloudfront-sync.service"
@@ -1392,21 +1393,55 @@ setup_xray_cloudfront() {
 
     mkdir -p "$CF_DIR" /var/log/xray
 
+    # =========================================================
+    # CLOUDFRONT SYNC TANPA RESTART XRAY
+    #
+    # Xray CloudFront dijalankan sebagai instance terpisah.
+    # User ditambah/dihapus melalui Xray HandlerService API (adu/rmu),
+    # sehingga perubahan akun tidak mematikan listener WS yang sedang aktif.
+    # File config tetap disimpan sebagai desired-state + backup/fallback.
+    # =========================================================
     cat > "$CF_SYNC" <<'PY'
 #!/usr/bin/env python3
-import json, os, sqlite3, tempfile, time
+import json, os, sqlite3, subprocess, tempfile, time
 DB="/var/lib/marzban/db.sqlite3"
 OUT="/var/lib/marzban/cloudfront/config.json"
+STATE="/var/lib/marzban/cloudfront/active-users.json"
+XRAY="/var/lib/marzban/core/xray"
+API="127.0.0.1:10085"
+TAGS={"vmess":"cf-vmess","vless":"cf-vless","trojan":"cf-trojan"}
+
 def active(expire,status):
     status=(status or "").lower()
     if status and status!="active": return False
     if expire not in (None,0) and int(expire)<=int(time.time()): return False
     return True
+
+def run_api(cmd, cfg):
+    r=subprocess.run([XRAY,"api",cmd,f"--server={API}",cfg],text=True,capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or f"xray api {cmd} gagal").strip())
+    return (r.stdout or "").strip()
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path),exist_ok=True)
+    fd,tmp=tempfile.mkstemp(prefix=".cf-",suffix=".json",dir=os.path.dirname(path))
+    with os.fdopen(fd,"w") as f:
+        json.dump(obj,f,indent=2,sort_keys=True); f.write("\n")
+    os.replace(tmp,path)
+
+def credential(ptype, settings):
+    if ptype in ("vmess","vless"):
+        uid=settings.get("id")
+        return str(uid) if uid else None
+    if ptype=="trojan":
+        pwd=settings.get("password")
+        return str(pwd) if pwd else None
+    return None
+
 if not os.path.isfile(DB): raise SystemExit("Database Marzban tidak ditemukan: "+DB)
 con=sqlite3.connect(DB); con.row_factory=sqlite3.Row
 try:
-    # Marzban 0.8.4: proxy definitions are stored in the separate
-    # `proxies` table; `users.proxies` is NOT a SQLite column.
     rows=con.execute("""
         SELECT u.username, u.status, u.expire, p.type, p.settings
         FROM users AS u
@@ -1414,38 +1449,94 @@ try:
         ORDER BY u.username
     """).fetchall()
 finally: con.close()
-vmess=[]; vless=[]; trojan=[]; sv=set(); sl=set(); st=set()
+
+wanted={}
 for r in rows:
     if not active(r["expire"],r["status"]): continue
     try: settings=json.loads(r["settings"] or "{}")
     except Exception: continue
     ptype=(r["type"] or "").lower()
-    if ptype == "vmess":
-        uid=settings.get("id")
-        if uid and uid not in sv:
-            vmess.append({"id":str(uid),"email":r["username"] or ""}); sv.add(uid)
-    elif ptype == "vless":
-        uid=settings.get("id")
-        if uid and uid not in sl:
-            vless.append({"id":str(uid),"email":r["username"] or ""}); sl.add(uid)
-    elif ptype == "trojan":
-        pwd=settings.get("password")
-        if pwd and pwd not in st:
-            trojan.append({"password":pwd,"email":r["username"] or ""}); st.add(pwd)
-cfg={"log":{"access":"/var/log/xray/cloudfront-access.log","error":"/var/log/xray/cloudfront-error.log","loglevel":"warning"},
-     "inbounds":[
-       {"listen":"127.0.0.1","port":10010,"protocol":"vmess","settings":{"clients":vmess},
-        "streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/vmess-cloudfront"}}},
-       {"listen":"127.0.0.1","port":10011,"protocol":"vless","settings":{"clients":vless,"decryption":"none"},
-        "streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/vless-cloudfront"}}},
-       {"listen":"127.0.0.1","port":10012,"protocol":"trojan","settings":{"clients":trojan},
-        "streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/trojan-cloudfront"}}}],
-     "outbounds":[{"protocol":"freedom","tag":"direct"}]}
-os.makedirs(os.path.dirname(OUT),exist_ok=True)
-fd,tmp=tempfile.mkstemp(prefix=".cloudfront-",suffix=".json",dir=os.path.dirname(OUT))
-with os.fdopen(fd,"w") as f: json.dump(cfg,f,indent=2); f.write("\n")
-os.replace(tmp,OUT)
-print("CloudFront sync: VMess=%d VLESS=%d Trojan=%d"%(len(vmess),len(vless),len(trojan)))
+    if ptype not in TAGS: continue
+    cred=credential(ptype,settings)
+    if not cred: continue
+    email=r["username"] or ""
+    if not email: continue
+    key=f"{ptype}|{email}"
+    wanted[key]={"type":ptype,"email":email,"credential":cred}
+
+vmess=[{"id":u["credential"],"email":u["email"]} for u in wanted.values() if u["type"]=="vmess"]
+vless=[{"id":u["credential"],"email":u["email"]} for u in wanted.values() if u["type"]=="vless"]
+trojan=[{"password":u["credential"],"email":u["email"]} for u in wanted.values() if u["type"]=="trojan"]
+
+cfg={
+ "api":{"tag":"api","listen":API,"services":["HandlerService"]},
+ "log":{"access":"/var/log/xray/cloudfront-access.log","error":"/var/log/xray/cloudfront-error.log","loglevel":"warning"},
+ "inbounds":[
+   {"tag":TAGS["vmess"],"listen":"127.0.0.1","port":10010,"protocol":"vmess","settings":{"clients":vmess},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/vmess-cloudfront","heartbeatPeriod":30}}},
+   {"tag":TAGS["vless"],"listen":"127.0.0.1","port":10011,"protocol":"vless","settings":{"clients":vless,"decryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/vless-cloudfront","heartbeatPeriod":30}}},
+   {"tag":TAGS["trojan"],"listen":"127.0.0.1","port":10012,"protocol":"trojan","settings":{"clients":trojan},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/trojan-cloudfront","heartbeatPeriod":30}}}],
+ "outbounds":[{"protocol":"freedom","tag":"direct"}]
+}
+write_json(OUT,cfg)
+
+# First run after installation: the running Xray process was started from
+# exactly this desired config, so only initialize state. No API mutation needed.
+if not os.path.isfile(STATE):
+    write_json(STATE,wanted)
+    print("CloudFront sync: initial state saved; no Xray restart.")
+    raise SystemExit(0)
+
+try:
+    with open(STATE) as f: previous=json.load(f)
+except Exception:
+    previous={}
+
+removed=[]; added=[]
+for key,old in previous.items():
+    if key not in wanted or wanted[key].get("credential") != old.get("credential") or wanted[key].get("type") != old.get("type"):
+        removed.append(old)
+for key,new in wanted.items():
+    if key not in previous or previous[key].get("credential") != new.get("credential") or previous[key].get("type") != new.get("type"):
+        added.append(new)
+
+if not removed and not added:
+    print("CloudFront sync: tidak ada perubahan; Xray tetap berjalan.")
+    raise SystemExit(0)
+
+# Build one small API config per operation. The API changes only the affected
+# user; existing WebSocket listeners and unrelated users remain untouched.
+files=[]
+try:
+    for u in removed:
+        p=u["type"]; c=u["credential"]
+        client=(
+            {"id":c,"email":u["email"]} if p in ("vmess","vless")
+            else {"password":c,"email":u["email"]}
+        )
+        one={"inbounds":[{"tag":TAGS[p],"protocol":p,"settings":{"clients":[client]}}]}
+        fd,path=tempfile.mkstemp(prefix="cf-rmu-",suffix=".json",dir="/var/lib/marzban/cloudfront")
+        os.close(fd); write_json(path,one); files.append(path)
+        run_api("rmu",path)
+    for u in added:
+        p=u["type"]; c=u["credential"]
+        client=(
+            {"id":c,"email":u["email"]} if p in ("vmess","vless")
+            else {"password":c,"email":u["email"]}
+        )
+        one={"inbounds":[{"tag":TAGS[p],"protocol":p,"settings":{"clients":[client]}}]}
+        fd,path=tempfile.mkstemp(prefix="cf-adu-",suffix=".json",dir="/var/lib/marzban/cloudfront")
+        os.close(fd); write_json(path,one); files.append(path)
+        run_api("adu",path)
+except Exception as e:
+    print("CloudFront API sync gagal:",e,file=__import__('sys').stderr)
+    raise SystemExit(1)
+finally:
+    for path in files:
+        try: os.unlink(path)
+        except OSError: pass
+
+write_json(STATE,wanted)
+print("CloudFront sync: added=%d removed=%d; Xray TIDAK direstart."%(len(added),len(removed)))
 PY
     chmod 755 "$CF_SYNC"
     python3 "$CF_SYNC"
@@ -1470,19 +1561,21 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
+    # Sinkronisasi hanya mengubah user melalui API. TIDAK ada try-restart/restart
+    # di service ini, sehingga koneksi WS aktif tidak diputus saat akun berubah.
     cat > "$CF_SYNC_SERVICE" <<EOF
 [Unit]
-Description=Sync Marzban users to Xray CloudFront
-After=docker.service
+Description=Sync Marzban users to Xray CloudFront without restart
+After=xray-cloudfront.service docker.service
+Requires=xray-cloudfront.service
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 ${CF_SYNC}
-ExecStartPost=/bin/systemctl try-restart xray-cloudfront.service
 EOF
 
     cat > "$CF_TIMER" <<EOF
 [Unit]
-Description=Periodic Marzban CloudFront user sync
+Description=Periodic Marzban CloudFront user sync without restart
 [Timer]
 OnBootSec=30s
 OnUnitActiveSec=30s
@@ -1493,27 +1586,22 @@ WantedBy=timers.target
 EOF
 
     # QUOTED heredoc: Nginx variables must reach Nginx literally.
-    # Bash must NOT expand $host/$request_uri/$http_upgrade.
     cat > "$CF_NGINX" <<'NGINX_EOF'
 server {
     listen 80;
     listen [::]:80;
     server_name __CF_DOMAIN__;
-
     location / {
         return 301 https://$host$request_uri;
     }
 }
-
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
     server_name __CF_DOMAIN__;
-
     ssl_certificate /var/lib/marzban/xray.crt;
     ssl_certificate_key /var/lib/marzban/xray.key;
     ssl_protocols TLSv1.2 TLSv1.3;
-
     location = /vmess-cloudfront {
         proxy_pass http://127.0.0.1:10010;
         proxy_http_version 1.1;
@@ -1524,7 +1612,6 @@ server {
         proxy_send_timeout 86400;
         proxy_buffering off;
     }
-
     location = /vless-cloudfront {
         proxy_pass http://127.0.0.1:10011;
         proxy_http_version 1.1;
@@ -1535,7 +1622,6 @@ server {
         proxy_send_timeout 86400;
         proxy_buffering off;
     }
-
     location = /trojan-cloudfront {
         proxy_pass http://127.0.0.1:10012;
         proxy_http_version 1.1;
@@ -1546,18 +1632,11 @@ server {
         proxy_send_timeout 86400;
         proxy_buffering off;
     }
-
-    location / {
-        return 404;
-    }
+    location / { return 404; }
 }
 NGINX_EOF
     sed -i "s#__CF_DOMAIN__#${CF_DOMAIN}#g" "$CF_NGINX"
 
-    # Jangan gunakan package Debian `yq`: pada environment ini parser-nya
-    # menghasilkan error:
-    #   Error: '//' expects 2 args but there is 1
-    # Gunakan PyYAML untuk memodifikasi compose secara portable.
     apt-get install -y python3-yaml >/dev/null 2>&1 || {
         colorized_echo red "❌ Gagal memasang python3-yaml."
         return 1
@@ -1566,14 +1645,11 @@ NGINX_EOF
     python3 - <<'PY'
 from pathlib import Path
 import yaml
-
 p = Path("/opt/marzban/docker-compose.yml")
 data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
 services = data.setdefault("services", {})
 nginx = services.get("nginx")
-if not isinstance(nginx, dict):
-    raise SystemExit("Service nginx tidak ditemukan di docker-compose.yml")
-
+if not isinstance(nginx, dict): raise SystemExit("Service nginx tidak ditemukan di docker-compose.yml")
 volumes = nginx.setdefault("volumes", [])
 required = [
     "/opt/marzban/nginx.conf:/etc/nginx/nginx.conf:ro",
@@ -1581,13 +1657,8 @@ required = [
     "/var/lib/marzban:/var/lib/marzban:ro",
 ]
 for item in required:
-    if item not in volumes:
-        volumes.append(item)
-
-p.write_text(
-    yaml.safe_dump(data, sort_keys=False, default_flow_style=False),
-    encoding="utf-8"
-)
+    if item not in volumes: volumes.append(item)
+p.write_text(yaml.safe_dump(data, sort_keys=False, default_flow_style=False), encoding="utf-8")
 print("NGINX_CLOUDFRONT_MOUNTS_OK")
 PY
 
@@ -1597,15 +1668,10 @@ from pathlib import Path
 p=Path("/opt/marzban/nginx.conf")
 s=p.read_text()
 needle="include /etc/nginx/cloudfront-nginx.conf;"
-lines=s.splitlines(True)
-depth=0
-in_http=False
-inserted=False
-out=[]
+lines=s.splitlines(True); depth=0; in_http=False; inserted=False; out=[]
 for line in lines:
     stripped=line.strip()
-    if stripped.startswith("http") and stripped.endswith("{") and not in_http:
-        in_http=True
+    if stripped.startswith("http") and stripped.endswith("{") and not in_http: in_http=True
     if in_http and stripped=="}" and depth==1 and not inserted:
         out.append("    "+needle+"\n"); inserted=True
     out.append(line)
@@ -1616,39 +1682,47 @@ p.write_text("".join(out))
 PY
     fi
 
-    # The downloaded certificate directory is already part of Marzban data;
-    # ensure nginx container has access to it through the mount above.
-
-    # Jangan biarkan service CloudFront lama hidup bersamaan.
     systemctl disable --now xray-cloudflare.service >/dev/null 2>&1 || true
-
     systemctl daemon-reload
     systemctl enable --now xray-cloudfront.service
-    systemctl enable --now marzban-cloudfront-sync.timer
 
+    # State dibuat setelah service pertama kali hidup. Ini mencegah sync awal
+    # menganggap semua user sebagai user baru dan mengirim adu ulang.
+    if [ ! -s "$CF_STATE" ]; then
+        python3 - <<PY
+import json
+p="$CF_CONFIG"; s="$CF_STATE"
+with open(p) as f: c=json.load(f)
+users={}
+for i in c.get("inbounds",[]):
+    typ=i.get("protocol")
+    for u in i.get("settings",{}).get("clients",[]):
+        cred=u.get("id") if typ in ("vmess","vless") else u.get("password")
+        email=u.get("email","")
+        if typ in ("vmess","vless","trojan") and cred and email:
+            users[f"{typ}|{email}"]={"type":typ,"email":email,"credential":str(cred)}
+with open(s,"w") as f: json.dump(users,f,indent=2,sort_keys=True); f.write("\n")
+PY
+    fi
+
+    systemctl enable --now marzban-cloudfront-sync.timer
     docker compose -f /opt/marzban/docker-compose.yml up -d --force-recreate nginx
 
-    # Jangan pernah menganggap Nginx berhasil hanya karena `up -d` selesai.
     for i in $(seq 1 15); do
-        if docker inspect -f '{{.State.Running}}' marzban-nginx-1 2>/dev/null | grep -q true; then
-            break
-        fi
+        if docker inspect -f '{{.State.Running}}' marzban-nginx-1 2>/dev/null | grep -q true; then break; fi
         sleep 2
     done
-
     if ! docker inspect -f '{{.State.Running}}' marzban-nginx-1 2>/dev/null | grep -q true; then
         colorized_echo red "❌ Container marzban-nginx-1 tidak RUNNING."
         docker logs --tail 80 marzban-nginx-1 2>&1 || true
         return 1
     fi
-
     docker compose -f /opt/marzban/docker-compose.yml exec -T nginx nginx -t
 
     systemctl is-active --quiet xray-cloudfront.service || {
         journalctl -u xray-cloudfront.service -n 80 --no-pager || true
         return 1
     }
-
     for p in 10010 10011 10012; do
         ss -lnt 2>/dev/null | grep -Eq ":${p}\\b" || {
             echo "CloudFront port ${p} tidak LISTEN."
@@ -1660,6 +1734,7 @@ PY
     echo -e "${GREEN}✓ Xray CloudFront: VMess + VLESS + Trojan.${NC}"
     echo "  Host   : ${CF_DOMAIN}:443"
     echo "  Paths  : /vmess-cloudfront /vless-cloudfront /trojan-cloudfront"
+    echo "  Sync   : API dinamis — tanpa restart Xray saat user berubah"
 }
 
 stage10() {
