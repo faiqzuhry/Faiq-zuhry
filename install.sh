@@ -557,8 +557,22 @@ apt install socat cron bash-completion -y
 #install cert
 curl -4fsSL https://get.acme.sh | sh -s email="$email"
 /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-CF_DOMAIN="cf.${domain}"
-/root/.acme.sh/acme.sh --server letsencrypt --register-account --issue -d "$domain" -d "$CF_DOMAIN" --standalone -k ec-256 --debug
+# Request the certificate only for the VPS domain.
+# cf.${domain} is handled by CloudFront and is intentionally not included.
+# ACME standalone membutuhkan TCP/80 kosong.
+# Matikan stack Marzban sementara bila sudah ada, lalu pastikan port 80 bebas.
+if [ -f /opt/marzban/docker-compose.yml ] || [ -f /opt/marzban/compose.yml ]; then
+    cd /opt/marzban
+    if command -v docker >/dev/null 2>&1; then
+        docker compose down >/dev/null 2>&1 || true
+    fi
+fi
+if ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)80$'; then
+    echo "ERROR: TCP/80 masih digunakan. ACME standalone tidak dapat dilanjutkan."
+    ss -ltnp 2>/dev/null | grep -E '(:|\])80[[:space:]]' || true
+    exit 1
+fi
+/root/.acme.sh/acme.sh --server letsencrypt --register-account --issue -d "$domain" --standalone -k ec-256 --debug
 ~/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath /var/lib/marzban/xray.crt --keypath /var/lib/marzban/xray.key --ecc
 wget -O /var/lib/marzban/xray_config.json "$sfile/xray_config.json"
 
@@ -595,11 +609,9 @@ wget -O addtrial "$sfile/addtrial" && chmod +x addtrial
 wget -O status "$sfile/status" && chmod +x status
 wget -qO /usr/bin/menu "$sfile/menu" && chmod 755 /usr/bin/menu
 test -s /usr/bin/menu || { echo "ERROR: file menu kosong/gagal di-download."; exit 1; }
-test -s /usr/bin/menu || { echo "ERROR: file menu kosong/gagal di-download."; exit 1; }
 bash -n /usr/bin/menu || { echo "ERROR: file menu dari repository tidak valid."; exit 1; }
 # Download ganti_domain sebagai file terpisah dari repository.
 wget -qO /usr/bin/ganti_domain "$sfile/ganti_domain" && chmod 755 /usr/bin/ganti_domain
-test -s /usr/bin/ganti_domain || { echo "ERROR: file ganti_domain kosong/gagal di-download."; exit 1; }
 test -s /usr/bin/ganti_domain || { echo "ERROR: file ganti_domain kosong/gagal di-download."; exit 1; }
 bash -n /usr/bin/ganti_domain || { echo "ERROR: file ganti_domain dari repository tidak valid."; exit 1; }
 wget -O ceklogin "$sfile/ceklogin" && chmod +x ceklogin
@@ -1127,7 +1139,13 @@ systemctl start ufw
 stage08() {
     set -e
 #install database
-wget -O /var/lib/marzban/db.sqlite3 "$sfile/db.sqlite3"
+# Jangan menimpa database Marzban yang sudah ada.
+if [ -s /var/lib/marzban/db.sqlite3 ]; then
+    echo "Database Marzban existing ditemukan; tidak ditimpa."
+    cp -a /var/lib/marzban/db.sqlite3 "/var/lib/marzban/db.sqlite3.backup.$(date +%Y%m%d-%H%M%S)"
+else
+    wget -O /var/lib/marzban/db.sqlite3 "$sfile/db.sqlite3"
+fi
 
 #install warp
 wget -O /root/warp "https://raw.githubusercontent.com/hamid-gh98/x-ui-scripts/main/install_warp_proxy.sh"
@@ -1251,7 +1269,7 @@ done
 # Kompatibilitas dengan model Admin pada image Marzban saat ini:
 # telegram_id harus integer dan discord_webhook berupa string.
 # Patch dilakukan DI DALAM container sebelum CLI dijalankan.
-if command -v marzban >/dev/null 2>&1; then
+if $COMPOSE_CMD exec -T marzban bash -lc 'command -v marzban >/dev/null 2>&1' >/dev/null 2>&1; then
     colorized_echo cyan "Menyiapkan kompatibilitas CLI admin Marzban..."
 
     $COMPOSE_CMD exec -T marzban python - <<'PY'
@@ -1288,7 +1306,7 @@ else:
     print("ADMIN_CLI_ALREADY_COMPATIBLE_OR_PATTERN_CHANGED")
 PY
 
-    if ! marzban cli admin import-from-env -y; then
+    if ! $COMPOSE_CMD exec -T marzban bash -lc 'marzban cli admin import-from-env -y'; then
         colorized_echo red "Import admin gagal."
         $COMPOSE_CMD logs --tail=80 marzban || true
         return 1
@@ -1611,11 +1629,15 @@ WantedBy=timers.target
 EOF
 
     # QUOTED heredoc: Nginx variables must reach Nginx literally.
+    # CloudFront AWS: sertifikat origin hanya mencakup DOMAIN utama.
+    # Karena itu CloudFront harus memakai ${domain} sebagai Origin Domain
+    # dan tidak meneruskan viewer Host (cf.${domain}) ke origin HTTPS.
+    # Nginx tetap menerima kedua Host agar tidak rapuh terhadap variasi Host header.
     cat > "$CF_NGINX" <<'NGINX_EOF'
 server {
     listen 80;
     listen [::]:80;
-    server_name __CF_DOMAIN__;
+    server_name __DOMAIN__ __CF_DOMAIN__;
     location / {
         return 301 https://$host$request_uri;
     }
@@ -1623,7 +1645,7 @@ server {
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
-    server_name __CF_DOMAIN__;
+    server_name __DOMAIN__ __CF_DOMAIN__;
     ssl_certificate /var/lib/marzban/xray.crt;
     ssl_certificate_key /var/lib/marzban/xray.key;
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -1632,7 +1654,7 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
+        proxy_set_header Host __DOMAIN__;
         proxy_read_timeout 86400;
         proxy_send_timeout 86400;
         proxy_buffering off;
@@ -1642,7 +1664,7 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
+        proxy_set_header Host __DOMAIN__;
         proxy_read_timeout 86400;
         proxy_send_timeout 86400;
         proxy_buffering off;
@@ -1652,7 +1674,7 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
+        proxy_set_header Host __DOMAIN__;
         proxy_read_timeout 86400;
         proxy_send_timeout 86400;
         proxy_buffering off;
@@ -1660,7 +1682,7 @@ server {
     location / { return 404; }
 }
 NGINX_EOF
-    sed -i "s#__CF_DOMAIN__#${CF_DOMAIN}#g" "$CF_NGINX"
+    sed -i -e "s#__DOMAIN__#${domain}#g" -e "s#__CF_DOMAIN__#${CF_DOMAIN}#g" "$CF_NGINX"
 
     apt-get install -y python3-yaml >/dev/null 2>&1 || {
         colorized_echo red "❌ Gagal memasang python3-yaml."
@@ -1756,7 +1778,8 @@ done
     done
 
     echo -e "${GREEN}✓ Xray CloudFront: VMess + VLESS + Trojan.${NC}"
-    echo "  Host   : ${CF_DOMAIN}:443"
+    echo "  Viewer : ${CF_DOMAIN}:443 (CloudFront AWS)"
+    echo "  Origin : ${domain}:443 (sertifikat origin hanya ${domain})"
     echo "  Paths  : /vmess-cloudfront /vless-cloudfront /trojan-cloudfront"
     echo "  Sync   : API dinamis — tanpa restart Xray saat user berubah"
 }
@@ -2044,13 +2067,6 @@ telegram_final_setup
 install_bot_usage
 
 colorized_echo green "╔════════════════════════════════════════════════════╗"
-colorized_echo green "║       LINGVPN MARZBAN INSTALLATION SELESAI       ║"
-colorized_echo green "╚════════════════════════════════════════════════════╝"
-log "INSTALLATION COMPLETE"
-echo
-read -rp "Reboot sekarang? [y/N]: " answer
-if [[ "$answer" =~ ^[Yy]$ ]]; then reboot; fi
-
 # =========================================================
 # FAIQVPN CHECK_USAGE BOT
 # Telegram token/chat ID memakai /etc/data/telegram_config.conf.
