@@ -40,6 +40,7 @@ LingVPN Installer
 Pemakaian:
   bash /root/install.sh                 # otomatis resume
   bash /root/install.sh --resume        # lanjut dari checkpoint terakhir
+  bash /root/install.sh --reinstall     # ulang seluruh tahap dari awal
   bash /root/install.sh --status        # lihat status tahap
   bash /root/install.sh --reset         # hapus checkpoint, ulang dari awal
 
@@ -64,6 +65,13 @@ case "${1:-}" in
     rm -f "$STATE_DIR"/stage_*.done
     log "Checkpoint di-reset. Instalasi akan dimulai dari tahap 01."
     ;;
+  --reinstall)
+    # Reinstall = jalankan ulang seluruh stage dari 01, bukan sekadar resume.
+    # Input tersimpan (/etc/data/*) dipertahankan agar tidak meminta ulang domain
+    # dan kredensial panel. Database Marzban juga tetap dilindungi oleh Stage 08.
+    rm -f "$STATE_DIR"/stage_*.done
+    log "REINSTALL diminta. Semua checkpoint stage dihapus; instalasi dimulai dari tahap 01."
+    ;;
   --resume|"") ;;
   -h|--help) usage; exit 0 ;;
   *) colorized_echo red "Opsi tidak dikenal: $1"; usage; exit 1 ;;
@@ -86,6 +94,7 @@ run_stage(){
     else
         log "FAILED ${id} - ${name} (exit=$?)"
         colorized_echo red "[x] Tahap ${id} gagal. Jalankan kembali: bash /root/install.sh --resume"
+        colorized_echo yellow "    Atau gunakan: bash /root/install.sh --reinstall untuk mengulang semua tahap dari awal."
         exit 1
     fi
 }
