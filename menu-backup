@@ -7,6 +7,7 @@ set -u
 
 DATA_DIR="/etc/data"
 CONFIG_FILE="${DATA_DIR}/telegram_config.conf"
+# SINGLE SOURCE OF TRUTH: BWBOT reads botToken/chatId from this file.
 NAME_FILE="${DATA_DIR}/nama"
 FILE_ID_FILE="${DATA_DIR}/file_id.txt"
 LOG_FILE="${DATA_DIR}/log-backup.txt"
@@ -27,7 +28,7 @@ print_header() {
     clear
     echo "**************************************************"
     echo "*                                                *"
-    echo "*       Backup and Restore Options Menu          *"
+    echo "*          MUMMY BACKUP & RESTORE MENU            *"
     echo "*                                                *"
     echo "**************************************************"
     echo
@@ -94,7 +95,7 @@ html_escape() {
 
 check_requirements() {
     local missing=()
-    for cmd in curl jq zip unzip docker crontab sqlite3; do
+    for cmd in curl jq zip unzip docker crontab sqlite3 find; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     if [ "${#missing[@]}" -gt 0 ]; then
@@ -132,8 +133,6 @@ backup_and_send_telegram() {
     for item in \
         /var/lib/marzban/xray_config.json \
         /var/lib/marzban/max_ips.conf \
-        /var/lib/marzban/xray.crt \
-        /var/lib/marzban/xray.key \
         /var/www/html \
         "$CONFIG_FILE" \
         "$FILE_ID_FILE"
@@ -266,250 +265,222 @@ remove_backup_timer() {
 
 restore_from_telegram() {
     print_header
+
     load_telegram_config || return 1
 
-    # Restore harus mengambil FILE BARU yang dikirim ke bot.
-    # Sebelum menunggu, hentikan sementara service lain yang mungkin memakai
-    # getUpdates (mis. check-usage.service), supaya update file tidak dimakan
-    # service lain lebih dahulu.
-    local FILE_ID="" FILE_PATH="" FILE_NAME="" TMP_DIR="" ZIP_FILE=""
-    local SAFETY_DIR="" COMPOSE_DIR="" DB_FILE="" TG_UPDATES=""
-    local FOUND_JSON="" GETFILE_JSON="" OK="" CONTAINER_NAMES=""
-    local BASELINE_ID="" NEXT_OFFSET="1" LAST_UPDATE_ID=""
-    local WAIT_SECONDS=300
-    local POLL_SERVICES=("check-usage.service" "bot-usage.service")
-    local STOPPED_SERVICES=()
+    # Restore otomatis:
+    # - tidak meminta File ID
+    # - tidak meminta password
+    # - mengambil File ID backup TERAKHIR dari file_id.txt
+    local FILE_ID FILE_PATH TMP_DIR ZIP_FILE ROOT DB_FILE
+    local SAFETY_DIR COMPOSE_DIR CONTAINER_NAMES TG_RESPONSE
+    local LAST_LINE
 
-    echo "=== RESTORE OTOMATIS DARI FILE TELEGRAM ==="
+    echo "=== RESTORE BACKUP DARI TELEGRAM ==="
+    echo
+    echo "Mode: OTOMATIS"
+    echo "Password: TIDAK DIGUNAKAN"
+    echo "File ID: mengambil backup terakhir"
+    echo
 
-    for cmd in curl jq unzip docker sqlite3; do
-        command -v "$cmd" >/dev/null 2>&1 || { red "Command belum tersedia: $cmd"; return 1; }
-    done
-    [ -d /opt/marzban ] || { red "/opt/marzban belum tersedia. Selesaikan install Marzban terlebih dahulu."; return 1; }
-
-    echo "[1/8] Menyiapkan Telegram..."
-
-    # getUpdates tidak dapat dipakai bila webhook aktif.
-    curl -fsS --connect-timeout 10 --max-time 20 \
-        "https://api.telegram.org/bot${botToken}/deleteWebhook?drop_pending_updates=false" \
-        >/dev/null 2>&1 || true
-
-    # Hentikan sementara bot lain yang menggunakan polling Telegram.
-    # Ini penting agar file yang baru dikirim tidak langsung diambil service lain.
-    local svc
-    for svc in "${POLL_SERVICES[@]}"; do
-        if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            systemctl stop "$svc" >/dev/null 2>&1 || true
-            if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
-                STOPPED_SERVICES+=("$svc")
-            fi
-        fi
-    done
-
-    telegram_get_updates() {
-        local offset="${1:-}"
-        local url="https://api.telegram.org/bot${botToken}/getUpdates?limit=100&timeout=5&allowed_updates=%5B%22message%22%5D"
-        [ -n "$offset" ] && url="${url}&offset=${offset}"
-        curl -fsS --connect-timeout 15 --max-time 30 "$url" 2>/dev/null || true
-    }
-
-    find_document_in_updates() {
-        printf '%s' "$1" | jq -r --arg chat "$chatId" '
-          [ .result[]?
-            | .message? as $m
-            | select($m != null and ($m.chat.id|tostring) == $chat)
-            | select($m.document != null)
-            | {
-                update_id: (.update_id // 0),
-                date: ($m.date // 0),
-                file_id: ($m.document.file_id // ""),
-                file_name: ($m.document.file_name // ""),
-                mime_type: ($m.document.mime_type // ""),
-                caption: ($m.caption // "")
-              }
-            | select(.file_id != "")
-          ] | sort_by(.date,.update_id) | last // empty | @json
-        ' 2>/dev/null
-    }
-
-    max_chat_update() {
-        printf '%s' "$1" | jq -r --arg chat "$chatId" '
-          [ .result[]? | select(.message?.chat?.id|tostring == $chat) | .update_id ]
-          | max // empty
-        ' 2>/dev/null
-    }
-
-    # Ambil update terakhir hanya sebagai titik awal. File yang dipakai harus
-    # datang SETELAH titik ini, sehingga tidak salah mengambil file lama.
-    echo "[2/8] Menunggu file backup baru..."
-    TG_UPDATES="$(telegram_get_updates)"
-    if [ "$(printf '%s' "$TG_UPDATES" | jq -r '.ok // false' 2>/dev/null)" != "true" ]; then
-        red "Telegram getUpdates gagal. Periksa BOT_TOKEN, CHAT_ID, internet, atau webhook."
-        for svc in "${STOPPED_SERVICES[@]}"; do systemctl start "$svc" >/dev/null 2>&1 || true; done
+    if [ ! -s "$FILE_ID_FILE" ]; then
+        red "Belum ada File ID backup Telegram di:"
+        red "$FILE_ID_FILE"
         return 1
     fi
 
-    BASELINE_ID="$(max_chat_update "$TG_UPDATES")"
-    if [[ "$BASELINE_ID" =~ ^[0-9]+$ ]]; then
-        NEXT_OFFSET=$((BASELINE_ID + 1))
-    else
-        NEXT_OFFSET=1
-    fi
-
-    echo
-    yellow "=================================================="
-    yellow " KIRIM FILE BACKUP SEKARANG KE BOT TELEGRAM"
-    yellow "=================================================="
-    echo "Chat ID yang dipantau : $chatId"
-    echo "File harus berupa ZIP backup Marzban."
-    echo "Menunggu maksimal ${WAIT_SECONDS} detik..."
-    echo
-
-    # Kirim instruksi ke chat agar jelas bahwa VPS sedang menunggu upload.
-    curl -fsS --connect-timeout 10 --max-time 20 \
-        -X POST "https://api.telegram.org/bot${botToken}/sendMessage" \
-        --data-urlencode "chat_id=${chatId}" \
-        --data-urlencode "text=Silakan kirim SEKARANG file backup ZIP Marzban ke bot ini. VPS sedang menunggu file secara otomatis." \
-        >/dev/null 2>&1 || true
-
-    local elapsed=0
-    while [ "$elapsed" -lt "$WAIT_SECONDS" ]; do
-        TG_UPDATES="$(telegram_get_updates "$NEXT_OFFSET")"
-        if [ "$(printf '%s' "$TG_UPDATES" | jq -r '.ok // false' 2>/dev/null)" = "true" ]; then
-            FOUND_JSON="$(find_document_in_updates "$TG_UPDATES")"
-            if [ -n "$FOUND_JSON" ] && [ "$FOUND_JSON" != "null" ]; then
-                FILE_ID="$(printf '%s' "$FOUND_JSON" | jq -r '.file_id')"
-                FILE_NAME="$(printf '%s' "$FOUND_JSON" | jq -r '.file_name')"
-                LAST_UPDATE_ID="$(printf '%s' "$FOUND_JSON" | jq -r '.update_id')"
-                break
-            fi
-
-            local maxid
-            maxid="$(max_chat_update "$TG_UPDATES")"
-            if [[ "$maxid" =~ ^[0-9]+$ ]]; then
-                NEXT_OFFSET=$((maxid + 1))
-            fi
-        fi
-        sleep 2
-        elapsed=$((elapsed + 2))
-    done
+    # Ambil File ID terakhir yang tersimpan.
+    FILE_ID="$(
+        grep -E '^File ID:[[:space:]]*[^[:space:]]+' "$FILE_ID_FILE" |
+        tail -n 1 |
+        sed -E 's/^File ID:[[:space:]]*//'
+    )"
 
     if [ -z "$FILE_ID" ]; then
-        red "File backup baru tidak ditemukan setelah ${WAIT_SECONDS} detik."
-        echo "Pastikan file dikirim ke chat yang sama dengan CHAT_ID di konfigurasi."
-        for svc in "${STOPPED_SERVICES[@]}"; do systemctl start "$svc" >/dev/null 2>&1 || true; done
+        red "File ID backup terakhir tidak ditemukan."
         return 1
     fi
 
-    green "[✓] File baru terdeteksi: ${FILE_NAME:-backup.zip}"
-    echo "[3/8] Mengambil file_path dari Telegram..."
+    echo "File ID otomatis : $FILE_ID"
+    echo
 
-    GETFILE_JSON="$(curl -fsS --connect-timeout 15 --max-time 30 \
-        --get --data-urlencode "file_id=$FILE_ID" \
-        "https://api.telegram.org/bot${botToken}/getFile" 2>/dev/null || true)"
-    OK="$(printf '%s' "$GETFILE_JSON" | jq -r '.ok // false' 2>/dev/null)"
-    FILE_PATH="$(printf '%s' "$GETFILE_JSON" | jq -r '.result.file_path // empty' 2>/dev/null)"
-    if [ "$OK" != "true" ] || [ -z "$FILE_PATH" ]; then
-        red "Telegram tidak dapat memberikan file_path untuk file tersebut."
-        for svc in "${STOPPED_SERVICES[@]}"; do systemctl start "$svc" >/dev/null 2>&1 || true; done
-        return 1
-    fi
+    for cmd in curl jq unzip docker sqlite3 find; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            red "Command belum tersedia: $cmd"
+            return 1
+        fi
+    done
 
     TMP_DIR="$(mktemp -d /root/mummy-restore.XXXXXX)"
     ZIP_FILE="$TMP_DIR/backup.zip"
     SAFETY_DIR="/root/mummy-restore-safety-$(date +%Y%m%d-%H%M%S)"
+
     cleanup_restore() {
         rm -rf "$TMP_DIR"
-        for svc in "${STOPPED_SERVICES[@]}"; do systemctl start "$svc" >/dev/null 2>&1 || true; done
     }
     trap cleanup_restore RETURN
 
-    echo "[4/8] Mengunduh file backup..."
-    if ! curl -fL --connect-timeout 15 --max-time 900 \
-        "https://api.telegram.org/file/bot${botToken}/${FILE_PATH}" -o "$ZIP_FILE"; then
-        red "Gagal mengunduh file dari Telegram."
-        return 1
-    fi
-    [ -s "$ZIP_FILE" ] || { red "File backup kosong."; return 1; }
+    echo "[1/6] Mengambil informasi file dari Telegram..."
 
-    echo "[5/8] Memeriksa dan mengekstrak backup..."
-    unzip -t "$ZIP_FILE" >/dev/null 2>&1 || { red "File yang dikirim bukan ZIP backup yang valid."; return 1; }
-    mkdir -p "$TMP_DIR/extract"
-    unzip -q "$ZIP_FILE" -d "$TMP_DIR/extract" || { red "Gagal mengekstrak backup."; return 1; }
-
-    DB_FILE="$(find "$TMP_DIR/extract" -type f -name 'db.sqlite3' -print -quit 2>/dev/null)"
-    [ -n "$DB_FILE" ] || { red "db.sqlite3 tidak ditemukan di dalam backup."; return 1; }
-    sqlite3 "$DB_FILE" 'PRAGMA integrity_check;' 2>/dev/null | grep -qx 'ok' || { red "Database backup rusak/tidak valid."; return 1; }
-
-    echo "[6/8] Menghentikan Marzban dan memulihkan data..."
-    mkdir -p "$SAFETY_DIR"
-    cp -a /var/lib/marzban "$SAFETY_DIR/marzban-live" 2>/dev/null || true
-
-    if [ -f /opt/marzban/docker-compose.yml ] || [ -f /opt/marzban/compose.yml ]; then
-        COMPOSE_DIR=/opt/marzban
-    else
-        red "Compose Marzban tidak ditemukan."
-        return 1
-    fi
-    cd "$COMPOSE_DIR" || return 1
-
-    if docker compose version >/dev/null 2>&1; then
-        docker compose stop marzban >/dev/null 2>&1 || true
-    elif command -v docker-compose >/dev/null 2>&1; then
-        docker-compose stop marzban >/dev/null 2>&1 || true
-    else
-        red "Docker Compose tidak tersedia."
-        return 1
-    fi
-
-    mkdir -p /var/lib/marzban
-    cp -f "$DB_FILE" /var/lib/marzban/db.sqlite3
-
-    local item src
-    for item in xray_config.json max_ips.conf xray.crt xray.key; do
-        src="$(find "$TMP_DIR/extract" -type f -name "$item" -print -quit 2>/dev/null)"
-        [ -n "$src" ] && cp -f "$src" "/var/lib/marzban/$item"
-    done
-    [ -f /var/lib/marzban/xray.crt ] && chmod 644 /var/lib/marzban/xray.crt || true
-    [ -f /var/lib/marzban/xray.key ] && chmod 600 /var/lib/marzban/xray.key || true
-
-    echo "[7/8] Menjalankan kembali Marzban..."
-    if docker compose version >/dev/null 2>&1; then docker compose up -d; else docker-compose up -d; fi
-    sleep 8
-
-    CONTAINER_NAMES="$(docker ps --format '{{.Names}}' | grep -Ei '(^|[-_])marzban($|[-_])' || true)"
-    if [ -z "$CONTAINER_NAMES" ]; then
-        red "Container Marzban belum aktif setelah restore."
-        echo "Safety backup: $SAFETY_DIR"
-        return 1
-    fi
-    sqlite3 /var/lib/marzban/db.sqlite3 'PRAGMA integrity_check;' 2>/dev/null | grep -qx 'ok' || {
-        red "Database hasil restore gagal integrity_check."
-        echo "Safety backup: $SAFETY_DIR"
+    TG_RESPONSE="$(
+        curl -fsS --connect-timeout 15 --max-time 60 \
+            "https://api.telegram.org/bot${botToken}/getFile?file_id=${FILE_ID}" \
+            2>/dev/null
+    )" || {
+        red "Gagal menghubungi Telegram."
         return 1
     }
 
-    {
-        printf '### auto-restore %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
-        printf 'File ID: %s\n' "$FILE_ID"
-        printf 'File Name: %s\n' "${FILE_NAME:-backup.zip}"
-    } >> "$FILE_ID_FILE"
+    if [ "$(printf '%s' "$TG_RESPONSE" | jq -r '.ok // false')" != "true" ]; then
+        red "File ID terakhir sudah tidak valid atau file tidak tersedia di Telegram."
+        printf '%s\n' "$TG_RESPONSE"
+        return 1
+    fi
 
-    if [[ "$LAST_UPDATE_ID" =~ ^[0-9]+$ ]]; then
-        curl -fsS --connect-timeout 10 --max-time 20 \
-            "https://api.telegram.org/bot${botToken}/getUpdates?offset=$((LAST_UPDATE_ID+1))&limit=1" \
-            >/dev/null 2>&1 || true
+    FILE_PATH="$(printf '%s' "$TG_RESPONSE" | jq -r '.result.file_path // empty')"
+
+    if [ -z "$FILE_PATH" ]; then
+        red "File path Telegram tidak ditemukan."
+        return 1
+    fi
+
+    echo "[2/6] Mengunduh backup terakhir dari Telegram..."
+
+    if ! curl -fsS --connect-timeout 15 --max-time 900 \
+        -o "$ZIP_FILE" \
+        "https://api.telegram.org/file/bot${botToken}/${FILE_PATH}"; then
+        red "Gagal mengunduh backup dari Telegram."
+        return 1
+    fi
+
+    [ -s "$ZIP_FILE" ] || {
+        red "File backup kosong."
+        return 1
+    }
+
+    echo "[3/6] Memeriksa dan mengekstrak ZIP TANPA PASSWORD..."
+
+    # ZIP backup memang dibuat tanpa password.
+    if ! unzip -t -q "$ZIP_FILE" >/dev/null 2>&1; then
+        red "File ZIP rusak, tidak valid, atau ternyata menggunakan password."
+        return 1
+    fi
+
+    mkdir -p "$TMP_DIR/extracted"
+
+    if ! unzip -q "$ZIP_FILE" -d "$TMP_DIR/extracted"; then
+        red "Gagal mengekstrak backup."
+        return 1
+    fi
+
+    DB_FILE="$(find "$TMP_DIR/extracted" -type f -name 'db.sqlite3' -print -quit)"
+
+    if [ -z "$DB_FILE" ] || [ ! -f "$DB_FILE" ]; then
+        red "db.sqlite3 tidak ditemukan di dalam backup."
+        return 1
+    fi
+
+    ROOT="$(dirname "$DB_FILE")"
+
+    echo "[4/6] Membuat safety backup database VPS baru..."
+
+    mkdir -p "$SAFETY_DIR"
+
+    if [ -f /var/lib/marzban/db.sqlite3 ]; then
+        cp -a /var/lib/marzban/db.sqlite3 "$SAFETY_DIR/db.sqlite3" || {
+            red "Gagal membuat safety backup database."
+            rm -rf "$SAFETY_DIR"
+            return 1
+        }
+    fi
+
+    COMPOSE_DIR=""
+
+    if [ -d /opt/marzban ]; then
+        if [ -f /opt/marzban/docker-compose.yml ] || [ -f /opt/marzban/compose.yml ]; then
+            COMPOSE_DIR="/opt/marzban"
+        fi
+    fi
+
+    if [ -n "$COMPOSE_DIR" ]; then
+        echo "[5/6] Menghentikan Marzban sementara..."
+        (
+            cd "$COMPOSE_DIR" &&
+            docker compose stop marzban 2>/dev/null || docker compose stop 2>/dev/null
+        ) || true
+    fi
+
+    mkdir -p /var/lib/marzban
+
+    echo "Mengembalikan database..."
+    if ! cp -a "$DB_FILE" /var/lib/marzban/db.sqlite3; then
+        red "Gagal mengembalikan db.sqlite3."
+        return 1
+    fi
+
+    chmod 600 /var/lib/marzban/db.sqlite3 2>/dev/null || true
+
+    for file in xray_config.json max_ips.conf; do
+        local FOUND
+        FOUND="$(find "$TMP_DIR/extracted" -type f -name "$file" -print -quit)"
+        if [ -n "$FOUND" ]; then
+            cp -a "$FOUND" "/var/lib/marzban/$file" || {
+                red "Gagal mengembalikan $file."
+                return 1
+            }
+        fi
+    done
+
+    echo "Menjalankan Marzban kembali..."
+
+    if [ -n "$COMPOSE_DIR" ]; then
+        (
+            cd "$COMPOSE_DIR" &&
+            docker compose up -d
+        ) || {
+            red "Marzban gagal dijalankan setelah restore."
+            red "Safety backup tersimpan di: $SAFETY_DIR"
+            return 1
+        }
+    else
+        red "Directory Docker Compose Marzban tidak ditemukan di /opt/marzban."
+        red "Database sudah direstore, tetapi Marzban belum direstart."
+        red "Safety backup tersimpan di: $SAFETY_DIR"
+        return 1
+    fi
+
+    sleep 5
+
+    CONTAINER_NAMES="$(
+        docker ps --format '{{.Names}}' 2>/dev/null |
+        grep -Ei '(^|[-_])marzban($|[-_])' || true
+    )"
+
+    if [ -z "$CONTAINER_NAMES" ]; then
+        red "Database sudah direstore, tetapi container Marzban belum aktif."
+        red "Safety backup tersimpan di: $SAFETY_DIR"
+        return 1
+    fi
+
+    if ! sqlite3 /var/lib/marzban/db.sqlite3 "PRAGMA integrity_check;" 2>/dev/null |
+        grep -qx 'ok'; then
+        red "PERINGATAN: integrity_check database tidak dapat dikonfirmasi."
+        red "Safety backup tersimpan di: $SAFETY_DIR"
+        return 1
     fi
 
     rm -rf "$SAFETY_DIR"
-    echo
-    green "=================================================="
-    green " RESTORE OTOMATIS VPS BARU BERHASIL"
-    green " File Telegram terdeteksi dan dipulihkan."
-    green "=================================================="
+
+    green "=============================================="
+    green " RESTORE OTOMATIS BERHASIL"
+    green " Backup terakhir dari Telegram telah direstore."
+    green " TANPA PASSWORD"
+    green "=============================================="
+
     command -v profile >/dev/null 2>&1 && profile || true
 }
 
+# Support cron calls without opening the interactive menu.
 case "${1:-}" in
     daily|weekly|monthly)
         backup_and_send_telegram
@@ -523,7 +494,7 @@ while :; do
     echo "1. Backup and Send to Telegram"
     echo "2. Set Backup Timer"
     echo "3. Remove Backup Timer"
-    echo "4. Restore Otomatis dari Telegram"
+    echo "4. Restore from Telegram"
     echo "5. Exit"
     read -r -p "Enter your choice (1-5): " choice
 

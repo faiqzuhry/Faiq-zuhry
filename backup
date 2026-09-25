@@ -148,7 +148,7 @@ else
 fi
 
 # ------------------------------------------------------------
-# Create encrypted ZIP
+# Create ZIP tanpa password
 # ------------------------------------------------------------
 curdir="/root/${nama}_${waktu}_${tanggal2}.zip"
 
@@ -202,10 +202,9 @@ CAPTION=$(cat <<EOF
 ◈ Version  : 3.1 Stable
 ◈ Built By  : @SaputraTech
 =================================
-➣ How To Restore ?
-➣ Use SFTP
-➣ Go to /var/lib/marzban
-➣ Replace file db.sqlite3
+➣ Restore via Telegram bot
+➣ Backup ZIP tidak menggunakan password
+➣ Pilih Restore pada bot untuk memulihkan backup
 =================================
 EOF
 )
