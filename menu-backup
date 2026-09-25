@@ -8,6 +8,7 @@ set -u
 DATA_DIR="/etc/data"
 CONFIG_FILE="${DATA_DIR}/telegram_config.conf"
 # SINGLE SOURCE OF TRUTH: BWBOT reads botToken/chatId from this file.
+PASS_FILE="${DATA_DIR}/passbackup"
 NAME_FILE="${DATA_DIR}/nama"
 FILE_ID_FILE="${DATA_DIR}/file_id.txt"
 LOG_FILE="${DATA_DIR}/log-backup.txt"
@@ -28,7 +29,7 @@ print_header() {
     clear
     echo "**************************************************"
     echo "*                                                *"
-    echo "*          MUMMY BACKUP & RESTORE MENU            *"
+    echo "*       Backup and Restore Options Menu          *"
     echo "*                                                *"
     echo "**************************************************"
     echo
@@ -95,7 +96,7 @@ html_escape() {
 
 check_requirements() {
     local missing=()
-    for cmd in curl jq zip unzip docker crontab sqlite3 find; do
+    for cmd in curl jq zip unzip docker crontab; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     if [ "${#missing[@]}" -gt 0 ]; then
@@ -109,10 +110,16 @@ backup_and_send_telegram() {
 
     load_telegram_config || return 1
 
+    if [ ! -s "$PASS_FILE" ]; then
+        red "Password backup tidak ditemukan: $PASS_FILE"
+        return 1
+    fi
+
     check_requirements || return 1
 
-    local nama tanggal tanggal2 waktu curdir response ok file_id
+    local InputPass nama tanggal tanggal2 waktu curdir response ok file_id
     local IP_ADDRESS CLIENT_NAME_ESCAPED IP_ADDRESS_ESCAPED CAPTION
+    InputPass="$(head -n 1 "$PASS_FILE")"
     nama="$(get_server_name)"
     tanggal="$(date '+%m-%d-%Y')"
     tanggal2="$(date '+%m%d%Y')"
@@ -143,7 +150,7 @@ backup_and_send_telegram() {
     curdir="/root/${nama}_${waktu}_${tanggal2}.zip"
     rm -f "$curdir"
 
-    if ! (cd /root && zip -r -q "$(basename "$curdir")" "$(basename "$BACKUP_DIR")"); then
+    if ! (cd /root && zip -r -q -P "$InputPass" "$(basename "$curdir")" "$(basename "$BACKUP_DIR")"); then
         red "Gagal membuat file ZIP."
         rm -rf "$BACKUP_DIR"
         return 1
@@ -268,43 +275,31 @@ restore_from_telegram() {
 
     load_telegram_config || return 1
 
-    # Restore otomatis:
-    # - tidak meminta File ID
-    # - tidak meminta password
-    # - mengambil File ID backup TERAKHIR dari file_id.txt
-    local FILE_ID FILE_PATH TMP_DIR ZIP_FILE ROOT DB_FILE
-    local SAFETY_DIR COMPOSE_DIR CONTAINER_NAMES TG_RESPONSE
-    local LAST_LINE
+    # Restore lintas VPS TIDAK menggunakan passbackup/File ID milik VPS baru.
+    # User memasukkan File ID backup lama dan password yang dipakai saat backup lama.
+    local FILE_ID InputPass FILE_PATH TMP_DIR ZIP_FILE ROOT DB_FILE
+    local SAFETY_DIR COMPOSE_DIR CONTAINER_NAMES
 
-    echo "=== RESTORE BACKUP DARI TELEGRAM ==="
+    echo "=== RESTORE BACKUP DARI VPS LAMA ==="
     echo
-    echo "Mode: OTOMATIS"
-    echo "Password: TIDAK DIGUNAKAN"
-    echo "File ID: mengambil backup terakhir"
-    echo
-
-    if [ ! -s "$FILE_ID_FILE" ]; then
-        red "Belum ada File ID backup Telegram di:"
-        red "$FILE_ID_FILE"
-        return 1
-    fi
-
-    # Ambil File ID terakhir yang tersimpan.
-    FILE_ID="$(
-        grep -E '^File ID:[[:space:]]*[^[:space:]]+' "$FILE_ID_FILE" |
-        tail -n 1 |
-        sed -E 's/^File ID:[[:space:]]*//'
-    )"
+    echo "Masukkan File ID dari backup Telegram VPS lama."
+    echo "Contoh: 1234567890"
+    read -r -p "File ID: " FILE_ID
 
     if [ -z "$FILE_ID" ]; then
-        red "File ID backup terakhir tidak ditemukan."
+        red "File ID tidak boleh kosong."
         return 1
     fi
 
-    echo "File ID otomatis : $FILE_ID"
+    read -r -s -p "Password ZIP backup VPS lama: " InputPass
     echo
 
-    for cmd in curl jq unzip docker sqlite3 find; do
+    if [ -z "$InputPass" ]; then
+        red "Password backup tidak boleh kosong."
+        return 1
+    fi
+
+    for cmd in curl jq unzip docker; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             red "Command belum tersedia: $cmd"
             return 1
@@ -320,19 +315,21 @@ restore_from_telegram() {
     }
     trap cleanup_restore RETURN
 
-    echo "[1/6] Mengambil informasi file dari Telegram..."
+    echo
+    echo "[1/6] Memeriksa File ID Telegram..."
 
+    local TG_RESPONSE
     TG_RESPONSE="$(
         curl -fsS --connect-timeout 15 --max-time 60 \
             "https://api.telegram.org/bot${botToken}/getFile?file_id=${FILE_ID}" \
             2>/dev/null
     )" || {
-        red "Gagal menghubungi Telegram."
+        red "Gagal menghubungi Telegram atau File ID tidak valid."
         return 1
     }
 
     if [ "$(printf '%s' "$TG_RESPONSE" | jq -r '.ok // false')" != "true" ]; then
-        red "File ID terakhir sudah tidak valid atau file tidak tersedia di Telegram."
+        red "Telegram menolak File ID tersebut."
         printf '%s\n' "$TG_RESPONSE"
         return 1
     fi
@@ -344,7 +341,7 @@ restore_from_telegram() {
         return 1
     fi
 
-    echo "[2/6] Mengunduh backup terakhir dari Telegram..."
+    echo "[2/6] Mengunduh backup lama..."
 
     if ! curl -fsS --connect-timeout 15 --max-time 900 \
         -o "$ZIP_FILE" \
@@ -358,25 +355,26 @@ restore_from_telegram() {
         return 1
     }
 
-    echo "[3/6] Memeriksa dan mengekstrak ZIP TANPA PASSWORD..."
+    echo "[3/6] Memeriksa password dan isi ZIP..."
 
-    # ZIP backup memang dibuat tanpa password.
-    if ! unzip -t -q "$ZIP_FILE" >/dev/null 2>&1; then
-        red "File ZIP rusak, tidak valid, atau ternyata menggunakan password."
+    if ! unzip -t -q -P "$InputPass" "$ZIP_FILE" >/dev/null 2>&1; then
+        red "Password SALAH atau file ZIP rusak."
+        red "Gunakan password yang dipakai di VPS LAMA saat membuat backup."
         return 1
     fi
 
     mkdir -p "$TMP_DIR/extracted"
 
-    if ! unzip -q "$ZIP_FILE" -d "$TMP_DIR/extracted"; then
+    if ! unzip -q -P "$InputPass" "$ZIP_FILE" -d "$TMP_DIR/extracted"; then
         red "Gagal mengekstrak backup."
         return 1
     fi
 
+    # Cari database di mana pun posisinya di dalam backup.
     DB_FILE="$(find "$TMP_DIR/extracted" -type f -name 'db.sqlite3' -print -quit)"
 
     if [ -z "$DB_FILE" ] || [ ! -f "$DB_FILE" ]; then
-        red "db.sqlite3 tidak ditemukan di dalam backup."
+        red "db.sqlite3 tidak ditemukan di dalam backup VPS lama."
         return 1
     fi
 
@@ -394,6 +392,8 @@ restore_from_telegram() {
         }
     fi
 
+    # Hentikan container Marzban sebelum mengganti database.
+    # Ini mencegah SQLite sedang ditulis ketika file diganti.
     COMPOSE_DIR=""
 
     if [ -d /opt/marzban ]; then
@@ -420,6 +420,7 @@ restore_from_telegram() {
 
     chmod 600 /var/lib/marzban/db.sqlite3 2>/dev/null || true
 
+    # Restore konfigurasi data jika tersedia.
     for file in xray_config.json max_ips.conf; do
         local FOUND
         FOUND="$(find "$TMP_DIR/extracted" -type f -name "$file" -print -quit)"
@@ -430,6 +431,10 @@ restore_from_telegram() {
             }
         fi
     done
+
+    # JANGAN menimpa /opt/marzban pada VPS baru.
+    # Compose/.env/config VPS baru harus tetap dipakai.
+    # Yang dipindahkan lintas VPS adalah data/database.
 
     echo "Menjalankan Marzban kembali..."
 
@@ -459,9 +464,11 @@ restore_from_telegram() {
     if [ -z "$CONTAINER_NAMES" ]; then
         red "Database sudah direstore, tetapi container Marzban belum aktif."
         red "Safety backup tersimpan di: $SAFETY_DIR"
+        red "Gunakan: cd /opt/marzban && docker compose ps"
         return 1
     fi
 
+    # Pastikan database SQLite bisa dibaca.
     if ! sqlite3 /var/lib/marzban/db.sqlite3 "PRAGMA integrity_check;" 2>/dev/null |
         grep -qx 'ok'; then
         red "PERINGATAN: integrity_check database tidak dapat dikonfirmasi."
@@ -472,9 +479,8 @@ restore_from_telegram() {
     rm -rf "$SAFETY_DIR"
 
     green "=============================================="
-    green " RESTORE OTOMATIS BERHASIL"
-    green " Backup terakhir dari Telegram telah direstore."
-    green " TANPA PASSWORD"
+    green " RESTORE VPS LAMA BERHASIL"
+    green " Database Marzban sudah dipindahkan ke VPS baru."
     green "=============================================="
 
     command -v profile >/dev/null 2>&1 && profile || true
