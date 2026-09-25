@@ -1479,67 +1479,92 @@ cfg={
 }
 write_json(OUT,cfg)
 
-# First run after installation: the running Xray process was started from
-# exactly this desired config, so only initialize state. No API mutation needed.
-if not os.path.isfile(STATE):
-    write_json(STATE,wanted)
-    print("CloudFront sync: initial state saved; no Xray restart.")
-    raise SystemExit(0)
+    # Runtime reconcile uses the proven full config.json API call.
+# This avoids the per-user temporary-file method that previously left
+# runtime empty on a fresh VPS.
+def runtime_users(tag):
+    r = subprocess.run(
+        [XRAY, "api", "inbounduser", f"--server={API}", f"-tag={tag}"],
+        text=True, capture_output=True
+    )
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "inbounduser gagal").strip())
+    try:
+        data = json.loads(r.stdout or "{}")
+    except Exception:
+        return []
+    return sorted(set(
+        item.get("email") for item in data.get("users", [])
+        if isinstance(item, dict) and item.get("email")
+    ))
+
+def remove_runtime(tag, emails):
+    if not emails:
+        return
+    r = subprocess.run(
+        [XRAY, "api", "rmu", f"--server={API}", f"-tag={tag}", *emails],
+        text=True, capture_output=True
+    )
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "rmu gagal").strip())
+
+def add_all_runtime():
+    # Proven working form: one adu call against the complete config.json.
+    r = subprocess.run(
+        [XRAY, "api", "adu", f"--server={API}", OUT],
+        text=True, capture_output=True
+    )
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "adu gagal").strip())
+
+expected = {
+    "cf-vmess": sorted(u["email"] for u in vmess),
+    "cf-vless": sorted(u["email"] for u in vless),
+    "cf-trojan": sorted(u["email"] for u in trojan),
+}
 
 try:
-    with open(STATE) as f: previous=json.load(f)
+    current = {tag: runtime_users(tag) for tag in expected}
 except Exception:
-    previous={}
+    # During the first installer pass Xray API may not be ready yet.
+    # Config generation must still succeed; the installer will run this script
+    # again after xray-cloudfront.service is confirmed ready.
+    current = None
 
-removed=[]; added=[]
-for key,old in previous.items():
-    if key not in wanted or wanted[key].get("credential") != old.get("credential") or wanted[key].get("type") != old.get("type"):
-        removed.append(old)
-for key,new in wanted.items():
-    if key not in previous or previous[key].get("credential") != new.get("credential") or previous[key].get("type") != new.get("type"):
-        added.append(new)
+if current is None:
+    print("CloudFront config dibuat; API runtime belum tersedia.")
+elif current != expected:
+    print("Runtime berbeda dari desired-state; melakukan reconcile...")
+    for tag, emails in current.items():
+        remove_runtime(tag, emails)
+    if wanted:
+        add_all_runtime()
 
-if not removed and not added:
-    print("CloudFront sync: tidak ada perubahan; Xray tetap berjalan.")
-    raise SystemExit(0)
-
-# Build one small API config per operation. The API changes only the affected
-# user; existing WebSocket listeners and unrelated users remain untouched.
-files=[]
-try:
-    for u in removed:
-        p=u["type"]; c=u["credential"]
-        client=(
-            {"id":c,"email":u["email"]} if p in ("vmess","vless")
-            else {"password":c,"email":u["email"]}
+    verified = {tag: runtime_users(tag) for tag in expected}
+    if verified != expected:
+        raise RuntimeError(
+            "Verifikasi runtime gagal: " + json.dumps(verified, sort_keys=True)
         )
-        one={"inbounds":[{"tag":TAGS[p],"protocol":p,"settings":{"clients":[client]}}]}
-        fd,path=tempfile.mkstemp(prefix="cf-rmu-",suffix=".json",dir="/var/lib/marzban/cloudfront")
-        os.close(fd); write_json(path,one); files.append(path)
-        run_api("rmu",path)
-    for u in added:
-        p=u["type"]; c=u["credential"]
-        client=(
-            {"id":c,"email":u["email"]} if p in ("vmess","vless")
-            else {"password":c,"email":u["email"]}
-        )
-        one={"inbounds":[{"tag":TAGS[p],"protocol":p,"settings":{"clients":[client]}}]}
-        fd,path=tempfile.mkstemp(prefix="cf-adu-",suffix=".json",dir="/var/lib/marzban/cloudfront")
-        os.close(fd); write_json(path,one); files.append(path)
-        run_api("adu",path)
-except Exception as e:
-    print("CloudFront API sync gagal:",e,file=__import__('sys').stderr)
-    raise SystemExit(1)
-finally:
-    for path in files:
-        try: os.unlink(path)
-        except OSError: pass
+    print("CloudFront runtime berhasil disamakan.")
+else:
+    print("CloudFront runtime sudah sesuai; tidak ada perubahan.")
 
-write_json(STATE,wanted)
-print("CloudFront sync: added=%d removed=%d; Xray TIDAK direstart."%(len(added),len(removed)))
+write_json(STATE, wanted)
+print("CloudFront sync selesai.")
+print(f"VMess  : {len(vmess)}")
+print(f"VLESS  : {len(vless)}")
+print(f"Trojan : {len(trojan)}")
+print(f"TOTAL  : {len(wanted)}")
+print("Xray TIDAK DIRESTART.")
 PY
     chmod 755 "$CF_SYNC"
-    python3 "$CF_SYNC"
+
+    # Generate desired config before Xray starts. Runtime API sync is done
+    # only after Xray API 127.0.0.1:10085 is confirmed ready.
+    python3 "$CF_SYNC" >/tmp/cloudfront-sync-initial.log 2>&1 || {
+        cat /tmp/cloudfront-sync-initial.log
+        return 1
+    }
 
     "$XRAY_BIN" run -test -config "$CF_CONFIG" >/tmp/xray-cloudfront-test.log 2>&1 || {
         cat /tmp/xray-cloudfront-test.log
@@ -1686,24 +1711,23 @@ PY
     systemctl daemon-reload
     systemctl enable --now xray-cloudfront.service
 
-    # State dibuat setelah service pertama kali hidup. Ini mencegah sync awal
-    # menganggap semua user sebagai user baru dan mengirim adu ulang.
-    if [ ! -s "$CF_STATE" ]; then
-        python3 - <<PY
-import json
-p="$CF_CONFIG"; s="$CF_STATE"
-with open(p) as f: c=json.load(f)
-users={}
-for i in c.get("inbounds",[]):
-    typ=i.get("protocol")
-    for u in i.get("settings",{}).get("clients",[]):
-        cred=u.get("id") if typ in ("vmess","vless") else u.get("password")
-        email=u.get("email","")
-        if typ in ("vmess","vless","trojan") and cred and email:
-            users[f"{typ}|{email}"]={"type":typ,"email":email,"credential":str(cred)}
-with open(s,"w") as f: json.dump(users,f,indent=2,sort_keys=True); f.write("\n")
-PY
+    # Wait until the CloudFront Xray API is actually listening.
+    for i in $(seq 1 30); do
+        if ss -lnt 2>/dev/null | grep -Eq ':10085\b'; then break; fi
+        sleep 1
+done
+    if ! ss -lnt 2>/dev/null | grep -Eq ':10085\b'; then
+        colorized_echo red "❌ Xray CloudFront API 127.0.0.1:10085 tidak LISTEN."
+        journalctl -u xray-cloudfront.service -n 80 --no-pager || true
+        return 1
     fi
+
+    # First runtime reconcile happens immediately. The timer is only the
+    # periodic safety net after the initial installation has been verified.
+    python3 "$CF_SYNC" || {
+        colorized_echo red "❌ Sinkronisasi awal CloudFront gagal."
+        return 1
+    }
 
     systemctl enable --now marzban-cloudfront-sync.timer
     docker compose -f /opt/marzban/docker-compose.yml up -d --force-recreate nginx
